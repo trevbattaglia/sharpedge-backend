@@ -160,18 +160,70 @@ def _two_way_card(market: str, ref_id: str, sides: Dict[str, int], model_q: Dict
         })
     return rows
 
+def best_price_line(bookmap: dict[str, int]) -> tuple[str, int]:
+    # choose best price for the bettor (max for +odds, min absolute for negative)
+    best_book, best_odds = None, None
+    for book, price in bookmap.items():
+        if best_odds is None:
+            best_book, best_odds = book, int(price)
+            continue
+        cur = int(price)
+        # pick higher for plus, closer to zero (less negative) for minus
+        if (cur > 0 and cur > best_odds) or (cur < 0 and (best_odds < 0 and cur > best_odds) or (best_odds > 0)):
+            best_book, best_odds = book, cur
+    return best_book or "consensus", best_odds or 0
 
-def _guard(api_key_header: Optional[str], need_key: str):
-    if api_key_header != need_key:
-        raise HTTPException(status_code=401, detail="invalid api key")
+@app.get("/build_batch")
+def build_batch(sport: str = "mlb"):
+    """Builds candidate batch items from /odds: ML (both sides) and one total per game."""
+    # call our own /odds stub
+    data = {
+        "sport": sport,
+        "markets": ["ml", "total"],
+        "books": ["dk", "mgm", "czu"]
+    }
+    # In a real app you’d call vendors. Here we reuse the stub directly:
+    odds = get_odds(sport=data["sport"], markets=data["markets"], books=data["books"]).body
+    import json
+    odds = json.loads(odds.decode("utf-8"))
 
-@app.post("/rank")
-def rank(payload: Dict[str, Any] = Body(...), authorization: Optional[str] = Header(None)):
-    # Expect "Bearer <API_KEY>"
-    need = os.getenv("API_KEY", "")
-    provided = (authorization or "").split("Bearer ")[-1].strip() if authorization else ""
-    _guard(provided, need_key=need)
-    ...
+    items: list[dict[str, Any]] = []
+    for g in odds.get("games", []):
+        gid = g["game_id"]
+        mkts = g.get("markets", {})
+
+        # Moneyline: take best price for each side if present
+        ml = mkts.get("ml")
+        if isinstance(ml, dict):
+            for side in [g["away"], g["home"]]:
+                if side in ml and isinstance(ml[side], dict) and ml[side]:
+                    _, best = best_price_line(ml[side])
+                    # placeholder model_q; your model service will fill these later
+                    items.append({
+                        "market": "ml",
+                        "ref_id": gid,
+                        "sides": {side: best, (g["home"] if side == g["away"] else g["away"]): -125},  # ensure two-way
+                        "model_q": {side: 0.53, (g["home"] if side == g["away"] else g["away"]): 0.47}
+                    })
+
+        # Totals: pick the first line key we see (e.g., 8.5_over/under)
+        tot = mkts.get("total")
+        if isinstance(tot, dict) and tot:
+            # Expect keys like '8.5_over' / '8.5_under'
+            over_key = next((k for k in tot.keys() if k.endswith("_over")), None)
+            under_key = over_key.replace("_over", "_under") if over_key else None
+            if over_key and under_key and over_key in tot and under_key in tot:
+                _, over_best = best_price_line(tot[over_key])
+                _, under_best = best_price_line(tot[under_key])
+                ref = f"{gid}:{over_key.split('_')[0]}"
+                items.append({
+                    "market": "total",
+                    "ref_id": ref,
+                    "sides": {"Over": over_best, "Under": under_best},
+                    "model_q": {"Over": 0.49, "Under": 0.51}
+                })
+
+    return JSONResponse({"items": items, "limits": {"ml": 5, "total": 5, "prop": 8}})
 
 @app.post("/rank")
 def rank(payload: Dict[str, Any] = Body(...)):
