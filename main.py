@@ -554,4 +554,179 @@ def _fetch_odds_oddsapi(sport: str, markets: list[str], books: list[str]) -> dic
     return {"sport": sport, "markets": markets, "books": books or [], "games": games}
 
 
+# ---- value scan helpers (no-model picks) ----
+def _devig_two_way_from_book(side_a_odds: int, side_b_odds: int) -> Tuple[float, float]:
+    """Return fair probs for a two-way market using a single book's prices."""
+    pa = american_to_implied(side_a_odds)
+    pb = american_to_implied(side_b_odds)
+    return devig_two_way(pa, pb)
 
+def _median(xs: List[float]) -> float:
+    ys = sorted(xs)
+    n = len(ys)
+    if n == 0: 
+        return 0.0
+    mid = n // 2
+    return (ys[mid] if n % 2 else 0.5 * (ys[mid-1] + ys[mid]))
+
+def _consensus_fair_from_books(two_way_prices: List[Tuple[int, int]]) -> Tuple[float, float]:
+    """
+    two_way_prices: list of (sideA_odds, sideB_odds) from different books.
+    Returns consensus (median across books) for sideA and sideB.
+    """
+    fair_a_list, fair_b_list = [], []
+    for a, b in two_way_prices:
+        fa, fb = _devig_two_way_from_book(a, b)
+        fair_a_list.append(fa)
+        fair_b_list.append(fb)
+    return _median(fair_a_list), _median(fair_b_list)
+
+def _collect_two_way_pairs(ml_market: Dict[str, Dict[str, int]], a_key: str, b_key: str) -> List[Tuple[int, int]]:
+    """
+    Given a market like:
+      {"HOU":{"dk":110,"mgm":112}, "NYY":{"dk":-130,"mgm":-128}}
+    return aligned pairs per book: [(HOU@dk, NYY@dk), (HOU@mgm, NYY@mgm), ...]
+    """
+    pairs = []
+    books = set(ml_market.get(a_key, {})) & set(ml_market.get(b_key, {}))
+    for bk in books:
+        try:
+            a = int(ml_market[a_key][bk])
+            b = int(ml_market[b_key][bk])
+            pairs.append((a, b))
+        except Exception:
+            continue
+    return pairs
+
+def _pairs_for_total(total_market: Dict[str, Dict[str, int]], pts_key: str) -> List[Tuple[int, int]]:
+    """
+    total_market example:
+      {"8.5_over":{"dk":-105,"mgm":-110}, "8.5_under":{"dk":-115,"mgm":-110}}
+    return aligned pairs per book for that points key.
+    """
+    over_key = f"{pts_key}_over"
+    under_key = f"{pts_key}_under"
+    if over_key not in total_market or under_key not in total_market:
+        return []
+    books = set(total_market[over_key]) & set(total_market[under_key])
+    pairs = []
+    for bk in books:
+        try:
+            o = int(total_market[over_key][bk])
+            u = int(total_market[under_key][bk])
+            pairs.append((o, u))
+        except Exception:
+            continue
+    return pairs
+
+@app.get("/picks")
+def picks(
+    sport: str = "mlb",
+    min_ev: float = 0.0,        # per $1, e.g. 0.01 = +1 cent / $1
+    min_edge: float = 0.0,      # in decimal (0.015 = 1.5%)
+    limit: int = 15
+):
+    """
+    Find +EV opportunities vs cross-book consensus (no external model needed).
+    Works for moneylines and a single totals number per game if available.
+    """
+    # get real odds (falls back to stub if provider fails)
+    data = get_odds(sport=sport, markets=["ml", "total"]).body
+    import json
+    data = json.loads(data.decode("utf-8"))
+
+    candidates: List[Dict[str, Any]] = []
+
+    for g in data.get("games", []):
+        gid = g["game_id"]
+        away, home = g.get("away"), g.get("home")
+        mkts = g.get("markets", {})
+
+        # ---- Moneylines: consensus fair and EV per book price ----
+        ml = mkts.get("ml", {})
+        if isinstance(ml, dict) and away in ml and home in ml and ml[away] and ml[home]:
+            # build book-aligned pairs
+            pairs = _collect_two_way_pairs(ml, away, home)
+            if pairs:
+                fair_away, fair_home = _consensus_fair_from_books(pairs)
+                # evaluate each available book price
+                for bk, price in ml.get(away, {}).items():
+                    q = fair_away
+                    odds = int(price)
+                    ev = ev_per_dollar(q, odds)
+                    edge = q - american_to_implied(odds)  # rough edge vs raw implied
+                    if ev >= min_ev and edge >= min_edge:
+                        candidates.append({
+                            "Market": "ML",
+                            "Game": gid,
+                            "Side": away,
+                            "Book": bk,
+                            "Line": odds,
+                            "ConsensusFair%": round(q*100, 1),
+                            "EV_per_$": round(ev, 4),
+                            "Kelly_half": round(min(kelly_half(q, odds), MAX_KELLY), 3),
+                        })
+                for bk, price in ml.get(home, {}).items():
+                    q = fair_home
+                    odds = int(price)
+                    ev = ev_per_dollar(q, odds)
+                    edge = q - american_to_implied(odds)
+                    if ev >= min_ev and edge >= min_edge:
+                        candidates.append({
+                            "Market": "ML",
+                            "Game": gid,
+                            "Side": home,
+                            "Book": bk,
+                            "Line": odds,
+                            "ConsensusFair%": round(q*100, 1),
+                            "EV_per_$": round(ev, 4),
+                            "Kelly_half": round(min(kelly_half(q, odds), MAX_KELLY), 3),
+                        })
+
+        # ---- Totals: pick one points key (first seen) and do the same ----
+        tot = mkts.get("total")
+        if isinstance(tot, dict) and tot:
+            # find a points bucket that exists on both over and under
+            pts_keys = sorted({k.split("_")[0] for k in tot.keys() if "_over" in k})
+            if pts_keys:
+                pts = pts_keys[0]
+                pairs = _pairs_for_total(tot, pts)
+                if pairs:
+                    fair_over, fair_under = _consensus_fair_from_books(pairs)
+                    over_key, under_key = f"{pts}_over", f"{pts}_under"
+                    for bk, price in tot.get(over_key, {}).items():
+                        q = fair_over
+                        odds = int(price)
+                        ev = ev_per_dollar(q, odds)
+                        edge = q - american_to_implied(odds)
+                        if ev >= min_ev and edge >= min_edge:
+                            candidates.append({
+                                "Market": f"Total {pts}",
+                                "Game": gid,
+                                "Side": "Over",
+                                "Book": bk,
+                                "Line": odds,
+                                "ConsensusFair%": round(q*100, 1),
+                                "EV_per_$": round(ev, 4),
+                                "Kelly_half": round(min(kelly_half(q, odds), MAX_KELLY), 3),
+                            })
+                    for bk, price in tot.get(under_key, {}).items():
+                        q = fair_under
+                        odds = int(price)
+                        ev = ev_per_dollar(q, odds)
+                        edge = q - american_to_implied(odds)
+                        if ev >= min_ev and edge >= min_edge:
+                            candidates.append({
+                                "Market": f"Total {pts}",
+                                "Game": gid,
+                                "Side": "Under",
+                                "Book": bk,
+                                "Line": odds,
+                                "ConsensusFair%": round(q*100, 1),
+                                "EV_per_$": round(ev, 4),
+                                "Kelly_half": round(min(kelly_half(q, odds), MAX_KELLY), 3),
+                            })
+
+    # sort best first
+    candidates.sort(key=lambda r: (r["EV_per_$"], r["Kelly_half"]), reverse=True)
+    return JSONResponse({"picks": candidates[:max(1, min(limit, 50))], "count": len(candidates)})
