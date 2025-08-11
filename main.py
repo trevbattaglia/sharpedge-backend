@@ -6,6 +6,19 @@ import httpx
 from functools import lru_cache
 import time
 
+import os
+from collections import defaultdict
+
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+BOOK_NAME_MAP = {
+    "draftkings": "dk",
+    "fanduel": "fd",
+    "betmgm": "mgm",
+    "caesars": "czu",     # keep your earlier code happy
+    "espnbet": "espn",
+}
+
+
 STATSAPI_BASE = "https://statsapi.mlb.com/api"
 
 app = FastAPI(title="SharpEdge Actions", version="1.0.0")
@@ -48,30 +61,36 @@ def version():
 # ---------- Endpoints (stubs) ----------
 @app.get("/odds")
 def get_odds(sport: str, markets: Optional[List[str]] = None, books: Optional[List[str]] = None):
-    """Stub multi-book odds for one MLB game."""
-    data = {
-        "sport": sport,
-        "markets": markets or ["ml", "total"],
-        "books": books or ["dk", "mgm", "czu"],
-        "games": [
-            {
-                "game_id": "mlb-nyy-hou-2025-08-11",
-                "away": "HOU",
-                "home": "NYY",
-                "markets": {
-                    "ml": {
-                        "HOU": {"dk": 110, "mgm": 112, "czu": 115},
-                        "NYY": {"dk": -130, "mgm": -128, "czu": -125}
+    markets = markets or ["ml", "total"]
+    books = books or []
+    try:
+        data = _fetch_odds_oddsapi(sport, markets, books)
+        return JSONResponse(data)
+    except Exception:
+        # graceful fallback to your existing stub
+        data = {
+            "sport": sport,
+            "markets": markets,
+            "books": books or ["dk", "mgm", "czu"],
+            "games": [
+                {
+                    "game_id": "mlb-nyy-hou-2025-08-11",
+                    "away": "HOU",
+                    "home": "NYY",
+                    "markets": {
+                        "ml": {
+                            "HOU": {"dk": 110, "mgm": 112, "czu": 115},
+                            "NYY": {"dk": -130, "mgm": -128, "czu": -125},
+                        },
+                        "total": {
+                            "8.5_over": {"dk": -105, "mgm": -110},
+                            "8.5_under": {"dk": -115, "mgm": -110},
+                        },
                     },
-                    "total": {
-                        "8.5_over": {"dk": -105, "mgm": -110},
-                        "8.5_under": {"dk": -115, "mgm": -110}
-                    }
                 }
-            }
-        ]
-    }
-    return JSONResponse(data)
+            ],
+        }
+        return JSONResponse(data)
 
 
 # 60s TTL cache for boxscores
@@ -423,3 +442,116 @@ def rank(payload: Dict[str, Any] = Body(...)):
 def news(sport: str):
     """Stub news/consensus response."""
     return JSONResponse({"sport": sport, "consensus": [], "injuries": [], "links": []})
+
+
+def _oddsapi_sport_code(sport: str) -> str:
+    if sport.lower() == "mlb":
+        return "baseball_mlb"
+    raise ValueError("Only mlb supported in this demo")
+
+def _normalize_team(name: str) -> str:
+    # Odds API gives full team names; map to your abbreviations when possible.
+    # Minimal approach: return last token if it's a known abbrev, else uppercase short name.
+    tok = name.split()[-1].upper()
+    return tok if 2 <= len(tok) <= 4 else name[:3].upper()
+
+def _fetch_odds_oddsapi(sport: str, markets: list[str], books: list[str]) -> dict:
+    api_key = os.getenv("ODDS_API_KEY")
+    if not api_key:
+        raise RuntimeError("ODDS_API_KEY missing")
+
+    sport_code = _oddsapi_sport_code(sport)
+    want_ml = "ml" in markets
+    want_total = "total" in markets
+
+    # Build bookmaker filter in provider's format
+    # If none requested, let provider return all and we'll filter client-side
+    bookmaker_param = None
+    if books:
+        # Map your short names back to provider names where possible
+        rev = {v: k for k, v in BOOK_NAME_MAP.items()}
+        prov_books = [rev.get(b.lower(), b) for b in books]
+        bookmaker_param = ",".join(prov_books)
+
+    params_base = {
+        "apiKey": api_key,
+        "regions": "us",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "bookmakers": bookmaker_param,
+    }
+
+    out_games = defaultdict(lambda: {"markets": {}})
+
+    with httpx.Client(timeout=15) as client:
+        if want_ml:
+            p = params_base | {"markets": "h2h"}
+            r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
+            r.raise_for_status()
+            for g in r.json():
+                gid = f"mlb-{_normalize_team(g['away_team']).lower()}-{_normalize_team(g['home_team']).lower()}-{dt.datetime.utcnow().date().isoformat()}"
+                away = _normalize_team(g["away_team"])
+                home = _normalize_team(g["home_team"])
+                node = out_games[gid]
+                node["game_id"] = gid
+                node["away"] = away
+                node["home"] = home
+                ml = node["markets"].setdefault("ml", defaultdict(dict))
+                for bk in g.get("bookmakers", []):
+                    bname = BOOK_NAME_MAP.get(bk["key"], bk["key"])
+                    for m in bk.get("markets", []):
+                        if m["key"] != "h2h":
+                            continue
+                        # outcomes are [{'name':'Yankees','price':-130}, {'name':'Astros','price':+115}]
+                        for o in m.get("outcomes", []):
+                            side = _normalize_team(o["name"])
+                            price = int(o["price"])
+                            ml[side][bname] = price
+
+        if want_total:
+            p = params_base | {"markets": "totals"}
+            r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
+            r.raise_for_status()
+            for g in r.json():
+                gid = f"mlb-{_normalize_team(g['away_team']).lower()}-{_normalize_team(g['home_team']).lower()}-{dt.datetime.utcnow().date().isoformat()}"
+                node = out_games[gid]
+                node["game_id"] = gid
+                over_under = node["markets"].setdefault("total", {})
+                for bk in g.get("bookmakers", []):
+                    bname = BOOK_NAME_MAP.get(bk["key"], bk["key"])
+                    for m in bk.get("markets", []):
+                        if m["key"] != "totals":
+                            continue
+                        # totals outcome example: {'name':'Over','point':8.5,'price':-105}
+                        pts = None
+                        over_price = None
+                        under_price = None
+                        for o in m.get("outcomes", []):
+                            pts = o.get("point", pts)
+                            if o["name"].lower() == "over":
+                                over_price = int(o["price"])
+                            elif o["name"].lower() == "under":
+                                under_price = int(o["price"])
+                        if pts is not None:
+                            over_key = f"{pts}_over"
+                            under_key = f"{pts}_under"
+                            over_bucket = over_under.setdefault(over_key, {})
+                            under_bucket = over_under.setdefault(under_key, {})
+                            if over_price is not None:
+                                over_bucket[bname] = over_price
+                            if under_price is not None:
+                                under_bucket[bname] = under_price
+
+    # Final list shape
+    games = []
+    for gid, v in out_games.items():
+        games.append({
+            "game_id": v["game_id"],
+            "away": v.get("away"),
+            "home": v.get("home"),
+            "markets": v["markets"],
+        })
+    return {"sport": sport, "markets": markets, "books": books or [], "games": games}
+
+
+
