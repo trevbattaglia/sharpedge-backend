@@ -11,33 +11,32 @@ from collections import defaultdict
 # ==============================
 # Config / constants
 # ==============================
-app = FastAPI(title="SharpEdge Actions", version="1.0.0")
+app = FastAPI(title="SharpEdge Actions", version="1.1.0")
 
 STATSAPI_BASE = "https://statsapi.mlb.com/api"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-# Provider -> our short code
+# Provider -> short code we use in API responses
 BOOK_NAME_MAP = {
     "draftkings": "dk",
     "fanduel": "fd",
     "betmgm": "mgm",
     "caesars": "czu",
     "espnbet": "espn",
-    "bovada": "bov",   # Bovada US
-    "bodog": "bov",    # Bodog CA alias -> treat as Bovada
+    "bovada": "bov",   # Bovada (US)
+    "bodog": "bov",    # Bodog (CA) → treat as Bovada
 }
 
-# Our short code -> provider key (explicit to avoid ambiguity)
+# Our short code -> provider key (for outbound filtering)
 BOOK_NAME_REV = {
     "dk": "draftkings",
     "fd": "fanduel",
     "mgm": "betmgm",
     "czu": "caesars",
     "espn": "espnbet",
-    "bov": "bovada",   # prefer Bovada
+    "bov": "bovada",
 }
 
-# Global thresholds / caps
 EDGE_THRESHOLD_DEFAULT = 0.015  # 1.5%
 MAX_KELLY = 0.05                # cap ½‑Kelly at 5%
 
@@ -84,6 +83,18 @@ def _iso_date(d: Optional[str]) -> str:
 def _mk_game_id(away_abbr: str, home_abbr: str, date_iso: str) -> str:
     return f"mlb-{away_abbr.lower()}-{home_abbr.lower()}-{date_iso}"
 
+def _normalize_team(name: str) -> str:
+    tok = name.split()[-1].upper()
+    return tok if 2 <= len(tok) <= 4 else name[:3].upper()
+
+def _pts_key(v: Any) -> str:
+    """Normalize points to a compact string (8.5, 9, -1.5 → '8.5','9','-1.5')."""
+    try:
+        f = float(v)
+        return f"{f:g}"
+    except Exception:
+        return str(v)
+
 # ==============================
 # Health / version
 # ==============================
@@ -93,7 +104,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "1.0.0", "endpoints": [
+    return {"version": "1.1.0", "endpoints": [
         "/odds", "/mlb/stats", "/mlb/savant",
         "/fangraphs/projections", "/model/probability",
         "/rank", "/news/consensus", "/build_batch", "/picks"
@@ -103,10 +114,6 @@ def version():
 # MLB Stats (probables + lineups w/ TTL)
 # ==============================
 def _lineup_from_boxscore(box: dict) -> Tuple[bool, List[dict], List[dict]]:
-    """
-    Returns: (confirmed, away_lineup, home_lineup)
-    Each lineup row: {id, name, pos, order}
-    """
     try:
         away_players = box["teams"]["away"]["players"]
         home_players = box["teams"]["home"]["players"]
@@ -163,10 +170,6 @@ def _fetch_boxscore(game_pk: int) -> dict:
 
 @app.get("/mlb/stats")
 def mlb_stats(date: Optional[str] = None):
-    """
-    schedule?sportId=1&date=YYYY-MM-DD&hydrate=probablePitcher,venue
-    + per-game boxscore (60s TTL) to infer lineup + extract player IDs
-    """
     date_iso = _iso_date(date)
     try:
         sched = _fetch_schedule(date_iso)
@@ -185,11 +188,6 @@ def mlb_stats(date: Optional[str] = None):
 
                 away_prob = g["teams"]["away"].get("probablePitcher") or {}
                 home_prob = g["teams"]["home"].get("probablePitcher") or {}
-                away_pid = away_prob.get("id")
-                home_pid = home_prob.get("id")
-                away_pname = away_prob.get("fullName") or away_prob.get("boxscoreName") or away_prob.get("lastFirstName")
-                home_pname = home_prob.get("fullName") or home_prob.get("boxscoreName") or home_prob.get("lastFirstName")
-
                 venue = (g.get("venue") or {}).get("name") or ""
 
                 confirmed = False
@@ -207,8 +205,8 @@ def mlb_stats(date: Optional[str] = None):
                     "away": away_abbr,
                     "home": home_abbr,
                     "probables": {
-                        away_abbr: {"id": away_pid, "name": away_pname},
-                        home_abbr: {"id": home_pid, "name": home_pname},
+                        away_abbr: {"id": away_prob.get("id"), "name": away_prob.get("fullName") or away_prob.get("boxscoreName")},
+                        home_abbr: {"id": home_prob.get("id"), "name": home_prob.get("fullName") or home_prob.get("boxscoreName")},
                     },
                     "park": venue,
                     "lineup_confirmed": confirmed,
@@ -250,19 +248,14 @@ def model_probability(payload: Dict[str, Any] = Body(...)):
     return JSONResponse({"q": q, "meta": {"note": "stubbed probs", "echo": payload}})
 
 # ==============================
-# The Odds API integration (Bovada-first)
+# The Odds API integration
 # ==============================
 def _oddsapi_sport_code(sport: str) -> str:
-    s = sport.lower()
-    if s == "mlb":
+    if sport.lower() == "mlb":
         return "baseball_mlb"
     raise ValueError("Only mlb supported in this demo")
 
-def _normalize_team(name: str) -> str:
-    tok = name.split()[-1].upper()
-    return tok if 2 <= len(tok) <= 4 else name[:3].upper()
-
-def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dict:
+def _fetch_odds_oddsapi(sport: str, markets: List[str], books: Optional[List[str]]) -> dict:
     api_key = os.getenv("ODDS_API_KEY")
     if not api_key:
         raise RuntimeError("ODDS_API_KEY missing")
@@ -272,21 +265,26 @@ def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dic
     want_total  = "total" in markets
     want_spread = "spread" in markets
 
-    # default to Bovada if not provided
-    books = books or ["bov"]
-    prov_books = []
-    for b in books:
-        b = b.lower()
-        prov_books.append(BOOK_NAME_REV.get(b, b))  # "bov" -> "bovada"
-    bookmaker_param = ",".join(sorted(set(prov_books)))
+    # If books is None → ask provider for ALL books (no bookmaker filter param)
+    # If books is [] → default to Bovada
+    bookmaker_param: Optional[str] = None
+    if books is None:
+        pass
+    else:
+        books = books or ["bov"]
+        prov_books = []
+        for b in books:
+            prov_books.append(BOOK_NAME_REV.get(b.lower(), b.lower()))
+        bookmaker_param = ",".join(sorted(set(prov_books)))
 
     params_base = {
         "apiKey": api_key,
         "regions": "us",
         "oddsFormat": "american",
         "dateFormat": "iso",
-        "bookmakers": bookmaker_param,
     }
+    if bookmaker_param:
+        params_base["bookmakers"] = bookmaker_param
 
     out_games = defaultdict(lambda: {"markets": {}})
 
@@ -298,7 +296,9 @@ def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dic
             p = params_base | {"markets": "h2h"}
             r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
             r.raise_for_status()
-            for g in r.json():
+            rows = r.json()
+            print(f"[odds] h2h games: {len(rows)} (books={bookmaker_param or 'ALL'})")
+            for g in rows:
                 gid  = _gid(g["away_team"], g["home_team"])
                 away = _normalize_team(g["away_team"])
                 home = _normalize_team(g["home_team"])
@@ -306,7 +306,7 @@ def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dic
                 node["game_id"], node["away"], node["home"] = gid, away, home
                 ml = node["markets"].setdefault("ml", defaultdict(dict))
                 for bk in g.get("bookmakers", []):
-                    bname = BOOK_NAME_MAP.get(bk["key"], bk["key"])  # -> short (e.g., "bov")
+                    bname = BOOK_NAME_MAP.get(bk["key"], bk["key"])
                     for m in bk.get("markets", []):
                         if m["key"] != "h2h":
                             continue
@@ -319,7 +319,9 @@ def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dic
             p = params_base | {"markets": "totals"}
             r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
             r.raise_for_status()
-            for g in r.json():
+            rows = r.json()
+            print(f"[odds] totals games: {len(rows)} (books={bookmaker_param or 'ALL'})")
+            for g in rows:
                 gid  = _gid(g["away_team"], g["home_team"])
                 away = _normalize_team(g["away_team"])
                 home = _normalize_team(g["home_team"])
@@ -341,15 +343,20 @@ def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dic
                             elif nm == "under":
                                 under_price = int(o["price"])
                         if pts is not None:
-                            over_key, under_key = f"{pts}_over", f"{pts}_under"
-                            tot.setdefault(over_key, {})[bname]  = over_price
-                            tot.setdefault(under_key, {})[bname] = under_price
+                            k = _pts_key(pts)
+                            over_key, under_key = f"{k}_over", f"{k}_under"
+                            if over_price is not None:
+                                tot.setdefault(over_key, {})[bname]  = over_price
+                            if under_price is not None:
+                                tot.setdefault(under_key, {})[bname] = under_price
 
         if want_spread:
             p = params_base | {"markets": "spreads"}
             r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
             r.raise_for_status()
-            for g in r.json():
+            rows = r.json()
+            print(f"[odds] spreads games: {len(rows)} (books={bookmaker_param or 'ALL'})")
+            for g in rows:
                 gid  = _gid(g["away_team"], g["home_team"])
                 away = _normalize_team(g["away_team"])
                 home = _normalize_team(g["home_team"])
@@ -363,9 +370,9 @@ def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dic
                             continue
                         for o in m.get("outcomes", []):
                             team  = _normalize_team(o["name"])
-                            point = o.get("point")
+                            point = _pts_key(o.get("point"))
                             price = int(o["price"])
-                            key   = f"{team}_{'+' if point >= 0 else ''}{point}"
+                            key   = f"{team}_{point if point.startswith('-') or point.startswith('+') else ('+'+point)}" if not point.startswith('-') else f"{team}_{point}"
                             spd.setdefault(key, {})[bname] = price
 
     games = []
@@ -376,19 +383,20 @@ def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dic
             "home": v.get("home"),
             "markets": v["markets"],
         })
-    return {"sport": sport, "markets": markets, "books": books or [], "games": games}
+    return {"sport": sport, "markets": markets, "books": books if books is not None else ["ALL"], "games": games}
 
-# Public /odds endpoint with graceful fallback
+# Public /odds with graceful fallback
 @app.get("/odds")
 def get_odds(sport: str, markets: Optional[List[str]] = None, books: Optional[List[str]] = None):
     markets = _ensure_list(markets) or ["ml", "total"]
-    books   = _ensure_list(books)   or []
+    books   = _ensure_list(books)   # NOTE: keep None if caller wants ALL books
     try:
         data = _fetch_odds_oddsapi(sport, markets, books)
         if not data.get("games"):
             raise RuntimeError("provider returned 0 games")
         return JSONResponse(data)
     except Exception as e:
+        print(f"[odds] fallback due to: {e}")
         data = {
             "sport": sport,
             "markets": markets,
@@ -559,13 +567,8 @@ def rank(payload: Dict[str, Any] = Body(...)):
     })
 
 # ==============================
-# Consensus +EV scan (Bovada-only by default)
+# Consensus +EV scan (target book vs consensus fair)
 # ==============================
-def _devig_two_way_from_book(side_a_odds: int, side_b_odds: int) -> Tuple[float, float]:
-    pa = american_to_implied(side_a_odds)
-    pb = american_to_implied(side_b_odds)
-    return devig_two_way(pa, pb)
-
 def _median(xs: List[float]) -> float:
     ys = sorted(xs)
     n = len(ys)
@@ -574,134 +577,40 @@ def _median(xs: List[float]) -> float:
     mid = n // 2
     return ys[mid] if n % 2 else 0.5 * (ys[mid - 1] + ys[mid])
 
-def _consensus_fair_from_books(two_way_prices: List[Tuple[int, int]]) -> Tuple[float, float]:
-    fair_a_list, fair_b_list = [], []
-    for a, b in two_way_prices:
-        fa, fb = _devig_two_way_from_book(a, b)
-        fair_a_list.append(fa)
-        fair_b_list.append(fb)
-    return _median(fair_a_list), _median(fair_b_list)
+def _devig_two_way_from_book(a: int, b: int) -> Tuple[float, float]:
+    return devig_two_way(american_to_implied(a), american_to_implied(b))
 
-def _collect_two_way_pairs(ml_market: Dict[str, Dict[str, int]], a_key: str, b_key: str) -> List[Tuple[int, int]]:
-    pairs = []
-    books = set(ml_market.get(a_key, {})) & set(ml_market.get(b_key, {}))
-    for bk in books:
-        try:
-            a = int(ml_market[a_key][bk])
-            b = int(ml_market[b_key][bk])
-            pairs.append((a, b))
-        except Exception:
-            continue
-    return pairs
-
-def _pairs_for_total(total_market: Dict[str, Dict[str, int]], pts_key: str) -> List[Tuple[int, int]]:
-    over_key = f"{pts_key}_over"
-    under_key = f"{pts_key}_under"
-    if over_key not in total_market or under_key not in total_market:
-        return []
-    books = set(total_market[over_key]) & set(total_market[under_key])
-    pairs = []
-    for bk in books:
-        try:
-            o = int(total_market[over_key][bk])
-            u = int(total_market[under_key][bk])
-            pairs.append((o, u))
-        except Exception:
-            continue
-    return pairs
+def _consensus_fair_from_pairs(pairs: List[Tuple[int, int]]) -> Tuple[float, float]:
+    fa, fb = [], []
+    for a, b in pairs:
+        x, y = _devig_two_way_from_book(a, b)
+        fa.append(x); fb.append(y)
+    return _median(fa), _median(fb)
 
 @app.get("/picks")
 def picks(
     sport: str = "mlb",
-    min_ev: float = 0.0,        # per $1, e.g. 0.005 = +0.5 cents
+    min_ev: float = 0.0,        # per $1 (e.g., 0.005 = +0.5¢ per $1)
     min_edge: float = 0.0,      # decimal (0.015 = 1.5%)
     limit: int = 30,
-    books: Optional[List[str]] = None,  # which books to RETURN as candidates; default Bovada
-    exclude_books_from_fair: Optional[List[str]] = None,  # books to EXCLUDE when computing consensus fair
+    books: Optional[List[str]] = None,              # which books to RETURN as candidates; default Bovada
+    exclude_books_from_fair: Optional[List[str]] = None,  # which books to EXCLUDE when computing FAIR; default target books
 ):
     """
-    +EV scan vs a target book set (default Bovada). We compute FAIR from a
-    consensus of *all* available books (optionally excluding the target book),
-    and only return candidates from the requested `books`.
+    Return +EV plays offered by `books` (default ['bov']) graded vs a consensus
+    FAIR built from ALL available books (optionally excluding the target book).
     """
     import json
 
-    # -------- target book(s) to show as picks (default Bovada) --------
     target_books = [b.lower() for b in (books or ["bov"])]
-
-    # -------- get consensus odds from all books --------
-    # Use None here to let the provider return everything it has
-    all_data = get_odds(sport=sport, markets=["ml", "total", "spread"], books=None).body
-    all_data = json.loads(all_data.decode("utf-8"))
-
-    # Which books to EXCLUDE from fair? (default: exclude the target books themselves)
     fair_excludes = set([b.lower() for b in (exclude_books_from_fair or target_books)])
 
-    # Helper: build per-game market views for ALL books (for FAIR)
-    def _pairs_from_all_books_two_way(ml_market: Dict[str, Dict[str, int]], a_key: str, b_key: str) -> List[Tuple[int, int]]:
-        pairs = []
-        books_shared = set(ml_market.get(a_key, {})) & set(ml_market.get(b_key, {}))
-        for bk in books_shared:
-            if bk.lower() in fair_excludes:
-                continue
-            try:
-                a = int(ml_market[a_key][bk])
-                b = int(ml_market[b_key][bk])
-                pairs.append((a, b))
-            except Exception:
-                continue
-        return pairs
-
-    def _pairs_from_all_books_total(total_market: Dict[str, Dict[str, int]], pts_key: str) -> List[Tuple[int, int]]:
-        over_key, under_key = f"{pts_key}_over", f"{pts_key}_under"
-        if over_key not in total_market or under_key not in total_market:
-            return []
-        books_shared = set(total_market[over_key]) & set(total_market[under_key])
-        pairs = []
-        for bk in books_shared:
-            if bk.lower() in fair_excludes:
-                continue
-            try:
-                o = int(total_market[over_key][bk])
-                u = int(total_market[under_key][bk])
-                pairs.append((o, u))
-            except Exception:
-                continue
-        return pairs
-
-    # For spreads we’ll pair by absolute point per book
-    def _pairs_from_all_books_spread(spread_market: Dict[str, Dict[str, int]], home: str, away: str, abs_point: float) -> List[Tuple[int, int]]:
-        # Build per-book home/away price at the requested abs_point
-        per_book: Dict[str, Dict[str, int]] = {}
-        for key in spread_market.keys():
-            try:
-                team, point_str = key.rsplit("_", 1)
-                point = float(point_str)
-            except Exception:
-                continue
-            if abs(point) != abs_point:
-                continue
-            for bk, price in spread_market[key].items():
-                if bk.lower() in fair_excludes:
-                    continue
-                d = per_book.setdefault(bk, {})
-                if team == home:
-                    d["home"] = int(price)
-                elif team == away:
-                    d["away"] = int(price)
-        pairs = []
-        for bk, sides in per_book.items():
-            if "home" in sides and "away" in sides:
-                pairs.append((sides["home"], sides["away"]))
-        return pairs
-
-    # -------- get candidate odds from target book(s) only --------
-    tgt_data = get_odds(sport=sport, markets=["ml", "total", "spread"], books=target_books).body
-    tgt_data = json.loads(tgt_data.decode("utf-8"))
+    # ALL books for FAIR
+    all_data = json.loads(get_odds(sport=sport, markets=["ml", "total", "spread"], books=None).body.decode("utf-8"))
+    # Target book(s) for candidates
+    tgt_data = json.loads(get_odds(sport=sport, markets=["ml", "total", "spread"], books=target_books).body.decode("utf-8"))
 
     candidates: List[Dict[str, Any]] = []
-
-    # Index ALL-book games by id for quick lookup
     all_by_gid = {g["game_id"]: g for g in all_data.get("games", [])}
 
     def _push(game_id: str, market_label: str, side_name: str, odds: int, q_fair: float, book: str):
@@ -719,7 +628,6 @@ def picks(
                 "Kelly_half": round(kelly_half(q_fair, odds), 3),
             })
 
-    # Walk target-book games and grade against consensus FAIR
     for g in tgt_data.get("games", []):
         gid  = g["game_id"]
         away = g.get("away")
@@ -727,64 +635,100 @@ def picks(
         mkts_tgt = g.get("markets", {})
         mkts_all = all_by_gid.get(gid, {}).get("markets", {})
 
-        # ---------- Moneyline ----------
+        # --------- Moneyline ---------
         ml_tgt = mkts_tgt.get("ml", {})
         ml_all = mkts_all.get("ml", {})
         if away in ml_tgt and home in ml_tgt and away in ml_all and home in ml_all:
-            pairs = _pairs_from_all_books_two_way(ml_all, away, home)
+            pairs = []
+            for bk in set(ml_all[away]).intersection(ml_all[home]):
+                if bk.lower() in fair_excludes:
+                    continue
+                try:
+                    pairs.append((int(ml_all[away][bk]), int(ml_all[home][bk])))
+                except Exception:
+                    continue
             if pairs:
-                fair_away, fair_home = _consensus_fair_from_books(pairs)
+                fair_away, fair_home = _consensus_fair_from_pairs(pairs)
                 for bk, price in ml_tgt.get(away, {}).items():
-                    if bk.lower() in (b.lower() for b in target_books):
+                    if bk.lower() in target_books:
                         _push(gid, "ML", away, int(price), fair_away, bk)
                 for bk, price in ml_tgt.get(home, {}).items():
-                    if bk.lower() in (b.lower() for b in target_books):
+                    if bk.lower() in target_books:
                         _push(gid, "ML", home, int(price), fair_home, bk)
 
-        # ---------- Totals ----------
+        # --------- Totals ---------
         tot_tgt = mkts_tgt.get("total", {})
         tot_all = mkts_all.get("total", {})
         if isinstance(tot_tgt, dict) and isinstance(tot_all, dict) and tot_tgt and tot_all:
-            pts_keys = sorted({k.split("_")[0] for k in tot_all.keys() if "_over" in k})
-            for pts in pts_keys:
-                pairs = _pairs_from_all_books_total(tot_all, pts)
+            pts_all = sorted({_pts_key(k.split("_")[0]) for k in tot_all.keys() if k.endswith("_over")})
+            for pts in pts_all:
+                over_key, under_key = f"{pts}_over", f"{pts}_under"
+                if over_key not in tot_all or under_key not in tot_all:
+                    continue
+                pairs = []
+                for bk in set(tot_all[over_key]).intersection(tot_all[under_key]):
+                    if bk.lower() in fair_excludes:
+                        continue
+                    try:
+                        pairs.append((int(tot_all[over_key][bk]), int(tot_all[under_key][bk])))
+                    except Exception:
+                        continue
                 if not pairs:
                     continue
-                fair_over, fair_under = _consensus_fair_from_books(pairs)
-                ok_over, ok_under = f"{pts}_over", f"{pts}_under"
-                for bk, price in tot_tgt.get(ok_over, {}).items():
-                    if bk.lower() in (b.lower() for b in target_books):
+                fair_over, fair_under = _consensus_fair_from_pairs(pairs)
+                # target prices at same points bucket (if offered)
+                for bk, price in tot_tgt.get(over_key, {}).items():
+                    if bk.lower() in target_books:
                         _push(gid, f"Total {pts}", "Over", int(price), fair_over, bk)
-                for bk, price in tot_tgt.get(ok_under, {}).items():
-                    if bk.lower() in (b.lower() for b in target_books):
+                for bk, price in tot_tgt.get(under_key, {}).items():
+                    if bk.lower() in target_books:
                         _push(gid, f"Total {pts}", "Under", int(price), fair_under, bk)
 
-        # ---------- Spreads ----------
+        # --------- Spreads (Run line) ---------
         spd_tgt = mkts_tgt.get("spread", {})
         spd_all = mkts_all.get("spread", {})
         if isinstance(spd_tgt, dict) and isinstance(spd_all, dict) and spd_tgt and spd_all:
-            # absolute points available in ALL-book view
             abs_points = sorted({abs(float(k.rsplit("_", 1)[1])) for k in spd_all.keys() if "_" in k})
             for ap in abs_points:
-                pairs = _pairs_from_all_books_spread(spd_all, home, away, ap)
+                # Build per-book pairs at this absolute point from ALL
+                per_book: Dict[str, Dict[str, int]] = {}
+                for key, bookmap in spd_all.items():
+                    try:
+                        team, point_str = key.rsplit("_", 1)
+                        p = float(point_str)
+                    except Exception:
+                        continue
+                    if abs(p) != ap:
+                        continue
+                    for bk, price in bookmap.items():
+                        if bk.lower() in fair_excludes:
+                            continue
+                        d = per_book.setdefault(bk, {})
+                        if team == home:
+                            d["home"] = int(price)
+                        elif team == away:
+                            d["away"] = int(price)
+                pairs = [(v["home"], v["away"]) for v in per_book.values() if "home" in v and "away" in v]
                 if not pairs:
                     continue
-                fair_home, fair_away = _consensus_fair_from_books(pairs)
-                # target prices at that point
+                fair_home, fair_away = _consensus_fair_from_pairs(pairs)
+
+                # Target book offers (if same point exists)
                 home_key = next((k for k in spd_tgt if k.startswith(home + "_") and abs(float(k.rsplit("_", 1)[1])) == ap), None)
                 away_key = next((k for k in spd_tgt if k.startswith(away + "_") and abs(float(k.rsplit("_", 1)[1])) == ap), None)
                 if home_key:
+                    pt = float(home_key.rsplit("_", 1)[1])
                     for bk, price in spd_tgt[home_key].items():
-                        if bk.lower() in (b.lower() for b in target_books):
-                            _push(gid, f"Spread {ap:g}", f"{home} {float(home_key.rsplit('_',1)[1]):+g}", int(price), fair_home, bk)
+                        if bk.lower() in target_books:
+                            _push(gid, f"Spread {ap:g}", f"{home} {pt:+g}", int(price), fair_home, bk)
                 if away_key:
+                    pt = float(away_key.rsplit("_", 1)[1])
                     for bk, price in spd_tgt[away_key].items():
-                        if bk.lower() in (b.lower() for b in target_books):
-                            _push(gid, f"Spread {ap:g}", f"{away} {float(away_key.rsplit('_',1)[1]):+g}", int(price), fair_away, bk)
+                        if bk.lower() in target_books:
+                            _push(gid, f"Spread {ap:g}", f"{away} {pt:+g}", int(price), fair_away, bk)
 
     candidates.sort(key=lambda r: (r["EV_per_$"], r["Kelly_half"]), reverse=True)
     return JSONResponse({"picks": candidates[:max(1, min(limit, 100))], "count": len(candidates)})
-
 
 # ==============================
 # News stub
