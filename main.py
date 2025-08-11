@@ -3,6 +3,7 @@ from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse
 from fastapi import Query
 from math import inf
+from fastapi import Header, HTTPException
 
 
 app = FastAPI(title="SharpEdge Actions", version="1.0.0")
@@ -85,6 +86,18 @@ def mlb_stats(date: Optional[str] = None):
             }
         ]
     })
+
+def _guard(api_key_header: Optional[str], need_key: str):
+    if api_key_header != need_key:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+@app.post("/rank")
+def rank(payload: Dict[str, Any] = Body(...), authorization: Optional[str] = Header(None)):
+    # Expect "Bearer <API_KEY>"
+    need = os.getenv("API_KEY", "")
+    provided = (authorization or "").split("Bearer ")[-1].strip() if authorization else ""
+    _guard(provided, need_key=need)
+    ...
 
 @app.get("/mlb/savant")
 def mlb_savant(player_id: str):
