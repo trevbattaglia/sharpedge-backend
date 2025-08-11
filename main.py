@@ -210,29 +210,61 @@ def build_batch(sport: str = "mlb"):
 
     return JSONResponse({"items": items, "limits": {"ml": 5, "total": 5, "prop": 8}})
 
-EDGE_THRESHOLD = 0.015  # 1.5%
-MAX_KELLY = 0.05
+# ---- global caps/thresholds ----
+EDGE_THRESHOLD_DEFAULT = 0.015  # 1.5%
+MAX_KELLY = 0.05                # 5% cap on ½‑Kelly output already
 
 @app.post("/rank")
 def rank(payload: Dict[str, Any] = Body(...)):
-    # NEW: per-request override (0.0 to force show)
+    """
+    Accepts EITHER a single item (back-compat) OR a batch.
+
+    Single example:
+      {
+        "market":"ml",
+        "game_id":"mlb-nyy-hou-2025-08-11",
+        "sides":{"HOU":115,"NYY":-125},
+        "model_q":{"HOU":0.47,"NYY":0.53}
+      }
+
+    Batch example:
+      {
+        "min_edge": 0.0,
+        "items": [ ... ],
+        "limits": {"ml":5,"total":5,"prop":8}
+      }
+    """
+    # Per-request override so you can force output (e.g., 0.0 in tests)
     min_edge = float(payload.get("min_edge", EDGE_THRESHOLD_DEFAULT))
 
-    # ... build `items` and `limits` as you already do ...
+    # --- normalize payload to items + limits ---
+    if "items" in payload:
+        items = payload["items"]
+        limits = payload.get("limits", {"ml": 5, "total": 5, "prop": 8})
+    else:
+        # single-item legacy
+        items = [{
+            "market": payload.get("market", "ml"),
+            "ref_id": payload.get("game_id") or payload.get("ref_id", "UNKNOWN"),
+            "sides": payload.get("sides", {}),
+            "model_q": payload.get("model_q", {})
+        }]
+        limits = {"ml": 5, "total": 5, "prop": 8}
 
-    all_cards: list[Dict[str, Any]] = []
+    # --- compute cards ---
+    all_cards: List[Dict[str, Any]] = []
     for it in items:
         market = str(it.get("market", "ml")).lower()
         ref_id = it.get("ref_id") or it.get("game_id") or "UNKNOWN"
         sides = it.get("sides", {})
         model_q = it.get("model_q", {})
         cards = _two_way_card(market, ref_id, sides, model_q)
-        # use the per-request threshold
+        # filter using per-request min_edge
         cards = [c for c in cards if c.get("Edge", 0) >= min_edge * 100.0]
         all_cards.extend(cards)
 
-    # Split and rank
-    def topn(mkt: str, n: int) -> list[Dict[str, Any]]:
+    # --- split & rank ---
+    def topn(mkt: str, n: int) -> List[Dict[str, Any]]:
         rows = [c for c in all_cards if c["Market"].lower() == mkt]
         rows.sort(key=lambda r: (r["EV_per_$"], r["Edge"], r["Kelly_half"]), reverse=True)
         return rows[:n]
@@ -241,6 +273,7 @@ def rank(payload: Dict[str, Any] = Body(...)):
     top_totals = topn("total",  limits.get("total", 5))
     top_props  = topn("prop",   limits.get("prop", 8))
 
+    # keep single-item shape for back-compat
     if "items" not in payload:
         single = sorted(all_cards, key=lambda r: r["EV_per_$"], reverse=True)
         return JSONResponse({"cards": single})
@@ -250,7 +283,7 @@ def rank(payload: Dict[str, Any] = Body(...)):
         "top_totals": top_totals,
         "top_props": top_props,
         "filters": {
-            "edge_threshold": EDGE_THRESHOLD,
+            "edge_threshold": min_edge,
             "kelly_cap": MAX_KELLY,
             "limits": limits
         }
