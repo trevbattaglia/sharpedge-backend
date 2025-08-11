@@ -1,6 +1,12 @@
 from typing import List, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, Body, Query
 from fastapi.responses import JSONResponse
+import datetime as dt
+import httpx
+from functools import lru_cache
+import time
+
+STATSAPI_BASE = "https://statsapi.mlb.com/api"
 
 app = FastAPI(title="SharpEdge Actions", version="1.0.0")
 
@@ -67,21 +73,145 @@ def get_odds(sport: str, markets: Optional[List[str]] = None, books: Optional[Li
     }
     return JSONResponse(data)
 
+
+# 60s TTL cache for boxscores
+_BOX_TTL_SEC = 60
+_BOX_CACHE: dict[int, tuple[float, dict]] = {}
+
+def _iso_date(d: Optional[str]) -> str:
+    return d or dt.datetime.utcnow().date().isoformat()
+
+def _mk_game_id(away_abbr: str, home_abbr: str, date_iso: str) -> str:
+    return f"mlb-{away_abbr.lower()}-{home_abbr.lower()}-{date_iso}"
+
+def _lineup_from_boxscore(box: dict) -> tuple[bool, list[dict], list[dict]]:
+    """
+    Returns: (confirmed, away_lineup, home_lineup)
+    Each lineup is a list of dicts: {id, name, pos, order}
+    """
+    try:
+        away_players = box["teams"]["away"]["players"]
+        home_players = box["teams"]["home"]["players"]
+
+        def starters(players: dict) -> list[dict]:
+            rows = []
+            for p in players.values():
+                order = p.get("battingOrder")
+                if not order:
+                    continue
+                try:
+                    order_i = int(order)
+                except Exception:
+                    continue
+                person = p.get("person", {})
+                pos = (p.get("position") or {}).get("abbreviation") or ""
+                rows.append({
+                    "id": person.get("id"),
+                    "name": person.get("fullName"),
+                    "pos": pos,
+                    "order": order_i
+                })
+            rows.sort(key=lambda r: r["order"])
+            # Only keep top 9 in batting order
+            return rows[:9]
+
+        away9 = starters(away_players)
+        home9 = starters(home_players)
+        confirmed = len(away9) >= 9 and len(home9) >= 9
+        return confirmed, away9, home9
+    except Exception:
+        return False, [], []
+
+@lru_cache(maxsize=16)
+def _fetch_schedule(date_iso: str) -> dict:
+    url = f"{STATSAPI_BASE}/v1/schedule"
+    # hydrate probable pitchers + venue so we get IDs + names
+    params = {
+        "sportId": 1,
+        "date": date_iso,
+        "hydrate": "probablePitcher,venue"
+    }
+    with httpx.Client(timeout=15) as client:
+        r = client.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+
+def _fetch_boxscore(game_pk: int) -> dict:
+    # TTL cache
+    now = time.time()
+    cached = _BOX_CACHE.get(game_pk)
+    if cached and (now - cached[0]) < _BOX_TTL_SEC:
+        return cached[1]
+    url = f"{STATSAPI_BASE}/v1/game/{game_pk}/boxscore"
+    with httpx.Client(timeout=15) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        data = r.json()
+    _BOX_CACHE[game_pk] = (now, data)
+    return data
+
 @app.get("/mlb/stats")
 def mlb_stats(date: Optional[str] = None):
-    """Stub MLB StatsAPI-like response; always returns 200."""
-    return JSONResponse({
-        "date": date or "unknown",
-        "games": [
-            {
-                "game_id": "mlb-nyy-hou-2025-08-11",
-                "probables": {"HOU": "Framber Valdez", "NYY": "Carlos Rodon"},
-                "bullpen_rest_index": {"HOU": 0.62, "NYY": 0.48},
-                "park": "Yankee Stadium",
-                "lineup_confirmed": False
-            }
-        ]
-    })
+    """
+    Real MLB StatsAPI integration with IDs + lineup TTL cache:
+    - schedule?sportId=1&date=YYYY-MM-DD&hydrate=probablePitcher,venue
+    - boxscore per gamePk (cached 60s) to infer lineup + extract IDs
+    """
+    date_iso = _iso_date(date)
+    try:
+        sched = _fetch_schedule(date_iso)
+    except Exception as e:
+        return JSONResponse({"date": date_iso, "games": [], "error": f"schedule fetch failed: {e}"}, status_code=200)
+
+    out_games: List[Dict[str, Any]] = []
+    for d in sched.get("dates", []):
+        for g in d.get("games", []):
+            try:
+                game_pk = g["gamePk"]
+                away_team = g["teams"]["away"]["team"]
+                home_team = g["teams"]["home"]["team"]
+                away_abbr = away_team.get("abbreviation") or away_team.get("teamName", "")[:3].upper()
+                home_abbr = home_team.get("abbreviation") or home_team.get("teamName", "")[:3].upper()
+
+                # Probables (IDs + names if present)
+                away_prob = g["teams"]["away"].get("probablePitcher") or {}
+                home_prob = g["teams"]["home"].get("probablePitcher") or {}
+                away_pid = away_prob.get("id")
+                home_pid = home_prob.get("id")
+                away_pname = away_prob.get("fullName") or away_prob.get("boxscoreName") or away_prob.get("lastFirstName")
+                home_pname = home_prob.get("fullName") or home_prob.get("boxscoreName") or home_prob.get("lastFirstName")
+
+                venue = (g.get("venue") or {}).get("name") or ""
+
+                # Boxscore → confirmed + lineups with IDs
+                confirmed = False
+                lineup_away, lineup_home = [], []
+                try:
+                    box = _fetch_boxscore(game_pk)
+                    confirmed, lineup_away, lineup_home = _lineup_from_boxscore(box)
+                except Exception:
+                    confirmed = False
+
+                out_games.append({
+                    "game_id": _mk_game_id(away_abbr, home_abbr, date_iso),
+                    "game_pk": game_pk,
+                    "away": away_abbr,
+                    "home": home_abbr,
+                    "probables": {
+                        away_abbr: {"id": away_pid, "name": away_pname},
+                        home_abbr: {"id": home_pid, "name": home_pname},
+                    },
+                    "park": venue,
+                    "lineup_confirmed": confirmed,
+                    "lineup": {
+                        away_abbr: lineup_away,
+                        home_abbr: lineup_home
+                    }
+                })
+            except Exception:
+                continue
+
+    return JSONResponse({"date": date_iso, "games": out_games})
 
 @app.get("/mlb/savant")
 def mlb_savant(player_id: str):
