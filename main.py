@@ -1,40 +1,48 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="SharpEdge Actions", version="1.0.0")
 
-# --- Helpers (math) ---
+# ---------- Helpers (math) ----------
 def american_to_implied(odds: int) -> float:
     if odds > 0:
-        return 100 / (odds + 100)
-    return (-odds) / (-odds + 100)
+        return 100.0 / (odds + 100.0)
+    return (-odds) / ((-odds) + 100.0)
 
 def decimal_from_american(odds: int) -> float:
-    if odds > 0:
-        return 1 + (odds / 100)
-    return 1 + (100 / -odds)
+    return 1.0 + (odds / 100.0) if odds > 0 else 1.0 + (100.0 / (-odds))
 
-def devig_two_way(p1: float, p2: float) -> (float, float):
+def devig_two_way(p1: float, p2: float) -> Tuple[float, float]:
     s = p1 + p2
     return (p1 / s, p2 / s) if s > 0 else (0.0, 0.0)
 
 def ev_per_dollar(q: float, odds: int) -> float:
     b = decimal_from_american(odds) - 1.0
-    return q * b - (1 - q)
+    return q * b - (1.0 - q)
 
 def kelly_half(q: float, odds: int) -> float:
     b = decimal_from_american(odds) - 1.0
-    k = (b*q - (1-q)) / b if b > 0 else 0.0
-    return max(0.0, k/2)  # half‑Kelly, floor at 0
+    k = (b * q - (1.0 - q)) / b if b > 0 else 0.0
+    return max(0.0, k / 2.0)
 
-# --- Endpoints (stubs you can extend) ---
+# ---------- Health ----------
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "sharpedge-backend"}
 
+@app.get("/version")
+def version():
+    return {"version": "1.0.0", "endpoints": [
+        "/odds", "/mlb/stats", "/mlb/savant",
+        "/fangraphs/projections", "/model/probability",
+        "/rank", "/news/consensus"
+    ]}
+
+# ---------- Endpoints (stubs) ----------
 @app.get("/odds")
 def get_odds(sport: str, markets: Optional[List[str]] = None, books: Optional[List[str]] = None):
-    """
-    Returns stub multi‑book odds for one MLB game so Actions wiring works.
-    """
+    """Stub multi-book odds for one MLB game."""
     data = {
         "sport": sport,
         "markets": markets or ["ml", "total"],
@@ -46,7 +54,7 @@ def get_odds(sport: str, markets: Optional[List[str]] = None, books: Optional[Li
                 "home": "NYY",
                 "markets": {
                     "ml": {
-                        "HOU": {"dk": +110, "mgm": +112, "czu": +115},
+                        "HOU": {"dk": 110, "mgm": 112, "czu": 115},
                         "NYY": {"dk": -130, "mgm": -128, "czu": -125}
                     },
                     "total": {
@@ -61,21 +69,23 @@ def get_odds(sport: str, markets: Optional[List[str]] = None, books: Optional[Li
 
 @app.get("/mlb/stats")
 def mlb_stats(date: Optional[str] = None):
+    """Stub MLB StatsAPI-like response; always returns 200."""
     return JSONResponse({
-        "date": date,
+        "date": date or "unknown",
         "games": [
             {
                 "game_id": "mlb-nyy-hou-2025-08-11",
                 "probables": {"HOU": "Framber Valdez", "NYY": "Carlos Rodon"},
-                "bullpen_rest_index": {"HOU": 0.62, "NYY": 0.48},  # 0 (gassed) → 1 (fresh)
-                "park": "Yankee Stadium"
+                "bullpen_rest_index": {"HOU": 0.62, "NYY": 0.48},
+                "park": "Yankee Stadium",
+                "lineup_confirmed": False
             }
         ]
     })
 
 @app.get("/mlb/savant")
 def mlb_savant(player_id: str):
-    # toy example: pitch mix and simple platoon split
+    """Stub Savant splits & pitch mix; always returns 200 for any player_id."""
     return JSONResponse({
         "player_id": player_id,
         "pitch_mix": {"sinker": 42.0, "curve": 27.0, "change": 12.0, "cutter": 11.0, "four_seam": 8.0},
@@ -84,31 +94,26 @@ def mlb_savant(player_id: str):
 
 @app.get("/fangraphs/projections")
 def fangraphs_projections(entity_id: str):
+    """Stub FanGraphs projections; always 200."""
     return JSONResponse({
         "entity_id": entity_id,
-        "projections": {
-            "K%": 24.5, "BB%": 7.1, "ERA": 3.65, "wOBA": 0.334, "TB_per_game": 1.75
-        }
+        "projections": {"K%": 24.5, "BB%": 7.1, "ERA": 3.65, "wOBA": 0.334, "TB_per_game": 1.75}
     })
 
 @app.post("/model/probability")
 def model_probability(payload: Dict[str, Any] = Body(...)):
-    """
-    Accepts anything; returns a sample model win prob for a two‑way ML.
-    payload suggestion:
-      {"game_id":"mlb-nyy-hou-2025-08-11","sides":{"HOU":{}, "NYY":{}}}
-    """
+    """Returns a sample model win prob for a two‑way ML."""
     q = {"HOU": 0.47, "NYY": 0.53}
-    return JSONResponse({"q": q, "meta": {"note": "stubbed probs"}})
+    return JSONResponse({"q": q, "meta": {"note": "stubbed probs", "echo": payload}})
 
 @app.post("/rank")
 def rank(payload: Dict[str, Any] = Body(...)):
     """
-    Input (example):
+    Example payload:
     {
       "market":"ml",
       "game_id":"mlb-nyy-hou-2025-08-11",
-      "sides":{"HOU":+115,"NYY":-125},
+      "sides":{"HOU":115,"NYY":-125},
       "model_q":{"HOU":0.47,"NYY":0.53}
     }
     """
@@ -117,7 +122,7 @@ def rank(payload: Dict[str, Any] = Body(...)):
     model_q = payload.get("model_q", {})
     keys = list(sides.keys())
     if len(keys) != 2:
-        return JSONResponse({"error": "only two‑way example in stub"}, status_code=400)
+        return JSONResponse({"error": "only two-way example in stub", "received": sides}, status_code=400)
 
     a, b = keys[0], keys[1]
     p_a = american_to_implied(int(sides[a]))
@@ -135,22 +140,17 @@ def rank(payload: Dict[str, Any] = Body(...)):
             "Market": market.upper(),
             "Side": team,
             "Line": odds,
-            "Fair%": round(fair*100, 1),
-            "Model%": round(q*100, 1),
-            "Edge": round(edge*100, 1),
+            "Fair%": round(fair * 100.0, 1),
+            "Model%": round(q * 100.0, 1),
+            "Edge": round(edge * 100.0, 1),
             "EV_per_$": round(ev, 4),
             "Kelly_half": round(k, 3),
             "Notes": "stub calc"
         })
-    # sort by EV desc
     rows.sort(key=lambda r: r["EV_per_$"], reverse=True)
     return JSONResponse({"cards": rows})
 
 @app.get("/news/consensus")
 def news(sport: str):
-    return JSONResponse({
-        "sport": sport,
-        "consensus": [],
-        "injuries": [],
-        "links": []
-    })
+    """Stub news/consensus response."""
+    return JSONResponse({"sport": sport, "consensus": [], "injuries": [], "links": []})
