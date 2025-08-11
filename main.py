@@ -215,23 +215,11 @@ MAX_KELLY = 0.05
 
 @app.post("/rank")
 def rank(payload: Dict[str, Any] = Body(...)):
-    """
-    Accepts EITHER a single item (back-compat) OR a batch list.
-    """
-    # Normalize to a list of items
-    if "items" in payload:
-        items = payload["items"]
-        limits = payload.get("limits", {"ml": 5, "total": 5, "prop": 8})
-    else:
-        items = [{
-            "market": payload.get("market", "ml"),
-            "ref_id": payload.get("game_id") or payload.get("ref_id", "UNKNOWN"),
-            "sides": payload.get("sides", {}),
-            "model_q": payload.get("model_q", {})
-        }]
-        limits = {"ml": 5, "total": 5, "prop": 8}
+    # NEW: per-request override (0.0 to force show)
+    min_edge = float(payload.get("min_edge", EDGE_THRESHOLD_DEFAULT))
 
-    # Compute cards
+    # ... build `items` and `limits` as you already do ...
+
     all_cards: list[Dict[str, Any]] = []
     for it in items:
         market = str(it.get("market", "ml")).lower()
@@ -239,7 +227,8 @@ def rank(payload: Dict[str, Any] = Body(...)):
         sides = it.get("sides", {})
         model_q = it.get("model_q", {})
         cards = _two_way_card(market, ref_id, sides, model_q)
-        cards = [c for c in cards if c.get("Edge", 0) >= EDGE_THRESHOLD * 100.0]
+        # use the per-request threshold
+        cards = [c for c in cards if c.get("Edge", 0) >= min_edge * 100.0]
         all_cards.extend(cards)
 
     # Split and rank
