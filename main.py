@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse
 from fastapi import Query
+from math import inf
 
 
 app = FastAPI(title="SharpEdge Actions", version="1.0.0")
@@ -158,6 +159,19 @@ def _two_way_card(market: str, ref_id: str, sides: Dict[str, int], model_q: Dict
             "Notes": note or "stub calc"
         })
     return rows
+
+
+def _guard(api_key_header: Optional[str], need_key: str):
+    if api_key_header != need_key:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+@app.post("/rank")
+def rank(payload: Dict[str, Any] = Body(...), authorization: Optional[str] = Header(None)):
+    # Expect "Bearer <API_KEY>"
+    need = os.getenv("API_KEY", "")
+    provided = (authorization or "").split("Bearer ")[-1].strip() if authorization else ""
+    _guard(provided, need_key=need)
+    ...
 
 @app.post("/rank")
 def rank(payload: Dict[str, Any] = Body(...)):
