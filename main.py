@@ -8,26 +8,34 @@ import time
 import os
 from collections import defaultdict
 
-# ------------------------------
+# ==============================
 # Config / constants
-# ------------------------------
+# ==============================
 app = FastAPI(title="SharpEdge Actions", version="1.0.0")
 
 STATSAPI_BASE = "https://statsapi.mlb.com/api"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-# Bookmaker display mapping (Odds API key -> our short code)
+# Provider -> our short code
 BOOK_NAME_MAP = {
     "draftkings": "dk",
     "fanduel": "fd",
     "betmgm": "mgm",
     "caesars": "czu",
     "espnbet": "espn",
-    # add more as needed
+    "bovada": "bov",   # Bovada US
+    "bodog": "bov",    # Bodog CA alias -> treat as Bovada
 }
 
-# For chunking bookmaker filters (keeps URLs sane)
-BOOK_CHUNK_SIZE = 8
+# Our short code -> provider key (explicit to avoid ambiguity)
+BOOK_NAME_REV = {
+    "dk": "draftkings",
+    "fd": "fanduel",
+    "mgm": "betmgm",
+    "czu": "caesars",
+    "espn": "espnbet",
+    "bov": "bovada",   # prefer Bovada
+}
 
 # Global thresholds / caps
 EDGE_THRESHOLD_DEFAULT = 0.015  # 1.5%
@@ -37,9 +45,16 @@ MAX_KELLY = 0.05                # cap ½‑Kelly at 5%
 _BOX_TTL_SEC = 60
 _BOX_CACHE: Dict[int, Tuple[float, dict]] = {}
 
-# ------------------------------
-# Odds math helpers
-# ------------------------------
+# ==============================
+# Helpers
+# ==============================
+def _ensure_list(xs):
+    if xs is None:
+        return None
+    if isinstance(xs, list):
+        return xs
+    return [p.strip() for p in str(xs).split(",") if p.strip()]
+
 def american_to_implied(odds: int) -> float:
     if odds > 0:
         return 100.0 / (odds + 100.0)
@@ -63,9 +78,15 @@ def kelly_half(q: float, odds: int) -> float:
     k = (b * q - (1.0 - q)) / b
     return max(0.0, min(k / 2.0, MAX_KELLY))
 
-# ------------------------------
+def _iso_date(d: Optional[str]) -> str:
+    return d or dt.datetime.utcnow().date().isoformat()
+
+def _mk_game_id(away_abbr: str, home_abbr: str, date_iso: str) -> str:
+    return f"mlb-{away_abbr.lower()}-{home_abbr.lower()}-{date_iso}"
+
+# ==============================
 # Health / version
-# ------------------------------
+# ==============================
 @app.get("/health")
 def health():
     return {"ok": True, "service": "sharpedge-backend"}
@@ -78,15 +99,9 @@ def version():
         "/rank", "/news/consensus", "/build_batch", "/picks"
     ]}
 
-# ------------------------------
+# ==============================
 # MLB Stats (probables + lineups w/ TTL)
-# ------------------------------
-def _iso_date(d: Optional[str]) -> str:
-    return d or dt.datetime.utcnow().date().isoformat()
-
-def _mk_game_id(away_abbr: str, home_abbr: str, date_iso: str) -> str:
-    return f"mlb-{away_abbr.lower()}-{home_abbr.lower()}-{date_iso}"
-
+# ==============================
 def _lineup_from_boxscore(box: dict) -> Tuple[bool, List[dict], List[dict]]:
     """
     Returns: (confirmed, away_lineup, home_lineup)
@@ -127,11 +142,7 @@ def _lineup_from_boxscore(box: dict) -> Tuple[bool, List[dict], List[dict]]:
 @lru_cache(maxsize=16)
 def _fetch_schedule(date_iso: str) -> dict:
     url = f"{STATSAPI_BASE}/v1/schedule"
-    params = {
-        "sportId": 1,
-        "date": date_iso,
-        "hydrate": "probablePitcher,venue"
-    }
+    params = {"sportId": 1, "date": date_iso, "hydrate": "probablePitcher,venue"}
     with httpx.Client(timeout=15) as client:
         r = client.get(url, params=params)
         r.raise_for_status()
@@ -201,19 +212,16 @@ def mlb_stats(date: Optional[str] = None):
                     },
                     "park": venue,
                     "lineup_confirmed": confirmed,
-                    "lineup": {
-                        away_abbr: lineup_away,
-                        home_abbr: lineup_home
-                    }
+                    "lineup": {away_abbr: lineup_away, home_abbr: lineup_home}
                 })
             except Exception:
                 continue
 
     return JSONResponse({"date": date_iso, "games": out_games})
 
-# ------------------------------
-# Fangraphs / Savant stubs
-# ------------------------------
+# ==============================
+# Fangraphs / Savant (stubs)
+# ==============================
 @app.get("/mlb/savant")
 def mlb_savant(player_id: str):
     return JSONResponse({
@@ -241,9 +249,9 @@ def model_probability(payload: Dict[str, Any] = Body(...)):
     q = {"HOU": 0.47, "NYY": 0.53}
     return JSONResponse({"q": q, "meta": {"note": "stubbed probs", "echo": payload}})
 
-# ------------------------------
-# The Odds API integration
-# ------------------------------
+# ==============================
+# The Odds API integration (Bovada-first)
+# ==============================
 def _oddsapi_sport_code(sport: str) -> str:
     s = sport.lower()
     if s == "mlb":
@@ -254,114 +262,111 @@ def _normalize_team(name: str) -> str:
     tok = name.split()[-1].upper()
     return tok if 2 <= len(tok) <= 4 else name[:3].upper()
 
-def _chunk(lst: List[str], size: int) -> List[List[str]]:
-    return [lst[i:i+size] for i in range(0, len(lst), size)]
-
 def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dict:
     api_key = os.getenv("ODDS_API_KEY")
     if not api_key:
         raise RuntimeError("ODDS_API_KEY missing")
 
-    sport_code = _oddsapi_sport_code(sport)
-    want_ml = "ml" in (m.lower() for m in markets)
-    want_total = "total" in (m.lower() for m in markets)
+    sport_code  = _oddsapi_sport_code(sport)
+    want_ml     = "ml" in markets
+    want_total  = "total" in markets
+    want_spread = "spread" in markets
 
-    # If books provided, map to provider names; otherwise None (provider returns all)
-    bookmaker_param_list: Optional[List[str]] = None
-    if books:
-        rev = {v: k for k, v in BOOK_NAME_MAP.items()}
-        bookmaker_param_list = [rev.get(b.lower(), b) for b in books]
+    # default to Bovada if not provided
+    books = books or ["bov"]
+    prov_books = []
+    for b in books:
+        b = b.lower()
+        prov_books.append(BOOK_NAME_REV.get(b, b))  # "bov" -> "bovada"
+    bookmaker_param = ",".join(sorted(set(prov_books)))
 
     params_base = {
         "apiKey": api_key,
         "regions": "us",
         "oddsFormat": "american",
         "dateFormat": "iso",
-        # "eventIds": "", # optional
+        "bookmakers": bookmaker_param,
     }
 
-    out_games: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"markets": {}})
+    out_games = defaultdict(lambda: {"markets": {}})
 
-    def _ingest_games(gjson: List[dict], mode: str):
-        for g in gjson:
-            gid = f"mlb-{_normalize_team(g['away_team']).lower()}-{_normalize_team(g['home_team']).lower()}-{dt.datetime.utcnow().date().isoformat()}"
-            away = _normalize_team(g["away_team"])
-            home = _normalize_team(g["home_team"])
-            node = out_games[gid]
-            node["game_id"] = gid
-            node["away"] = away
-            node["home"] = home
+    def _gid(away_name, home_name):
+        return f"mlb-{_normalize_team(away_name).lower()}-{_normalize_team(home_name).lower()}-{dt.datetime.utcnow().date().isoformat()}"
 
-            for bk in g.get("bookmakers", []):
-                bname = BOOK_NAME_MAP.get(bk["key"], bk["key"])
-                for m in bk.get("markets", []):
-                    key = m.get("key")
-                    if mode == "h2h" and key != "h2h":
-                        continue
-                    if mode == "totals" and key != "totals":
-                        continue
-
-                    if key == "h2h":
-                        ml = node["markets"].setdefault("ml", defaultdict(dict))
+    with httpx.Client(timeout=20) as client:
+        if want_ml:
+            p = params_base | {"markets": "h2h"}
+            r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
+            r.raise_for_status()
+            for g in r.json():
+                gid  = _gid(g["away_team"], g["home_team"])
+                away = _normalize_team(g["away_team"])
+                home = _normalize_team(g["home_team"])
+                node = out_games[gid]
+                node["game_id"], node["away"], node["home"] = gid, away, home
+                ml = node["markets"].setdefault("ml", defaultdict(dict))
+                for bk in g.get("bookmakers", []):
+                    bname = BOOK_NAME_MAP.get(bk["key"], bk["key"])  # -> short (e.g., "bov")
+                    for m in bk.get("markets", []):
+                        if m["key"] != "h2h":
+                            continue
                         for o in m.get("outcomes", []):
-                            side = _normalize_team(o["name"])
+                            side  = _normalize_team(o["name"])
                             price = int(o["price"])
                             ml[side][bname] = price
 
-                    elif key == "totals":
-                        tot = node["markets"].setdefault("total", {})
+        if want_total:
+            p = params_base | {"markets": "totals"}
+            r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
+            r.raise_for_status()
+            for g in r.json():
+                gid  = _gid(g["away_team"], g["home_team"])
+                away = _normalize_team(g["away_team"])
+                home = _normalize_team(g["home_team"])
+                node = out_games[gid]
+                node["game_id"], node["away"], node["home"] = gid, away, home
+                tot = node["markets"].setdefault("total", {})
+                for bk in g.get("bookmakers", []):
+                    bname = BOOK_NAME_MAP.get(bk["key"], bk["key"])
+                    for m in bk.get("markets", []):
+                        if m["key"] != "totals":
+                            continue
                         pts = None
-                        over_price, under_price = None, None
+                        over_price = under_price = None
                         for o in m.get("outcomes", []):
                             pts = o.get("point", pts)
-                            nm = o["name"].lower()
+                            nm  = o["name"].lower()
                             if nm == "over":
                                 over_price = int(o["price"])
                             elif nm == "under":
                                 under_price = int(o["price"])
                         if pts is not None:
-                            over_key = f"{pts}_over"
-                            under_key = f"{pts}_under"
-                            if over_price is not None:
-                                tot.setdefault(over_key, {})[bname] = over_price
-                            if under_price is not None:
-                                tot.setdefault(under_key, {})[bname] = under_price
+                            over_key, under_key = f"{pts}_over", f"{pts}_under"
+                            tot.setdefault(over_key, {})[bname]  = over_price
+                            tot.setdefault(under_key, {})[bname] = under_price
 
-    with httpx.Client(timeout=20) as client:
-        # h2h (moneyline)
-        if want_ml:
-            if bookmaker_param_list:
-                for chunk in _chunk(bookmaker_param_list, BOOK_CHUNK_SIZE):
-                    p = params_base | {"markets": "h2h", "bookmakers": ",".join(chunk)}
-                    r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
-                    try:
-                        r.raise_for_status()
-                        _ingest_games(r.json(), "h2h")
-                    except Exception:
-                        # keep going; totals might still work
-                        pass
-            else:
-                p = params_base | {"markets": "h2h"}
-                r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
-                r.raise_for_status()
-                _ingest_games(r.json(), "h2h")
-
-        # totals
-        if want_total:
-            if bookmaker_param_list:
-                for chunk in _chunk(bookmaker_param_list, BOOK_CHUNK_SIZE):
-                    p = params_base | {"markets": "totals", "bookmakers": ",".join(chunk)}
-                    r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
-                    try:
-                        r.raise_for_status()
-                        _ingest_games(r.json(), "totals")
-                    except Exception:
-                        pass
-            else:
-                p = params_base | {"markets": "totals"}
-                r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
-                r.raise_for_status()
-                _ingest_games(r.json(), "totals")
+        if want_spread:
+            p = params_base | {"markets": "spreads"}
+            r = client.get(f"{ODDS_API_BASE}/sports/{sport_code}/odds", params=p)
+            r.raise_for_status()
+            for g in r.json():
+                gid  = _gid(g["away_team"], g["home_team"])
+                away = _normalize_team(g["away_team"])
+                home = _normalize_team(g["home_team"])
+                node = out_games[gid]
+                node["game_id"], node["away"], node["home"] = gid, away, home
+                spd = node["markets"].setdefault("spread", {})
+                for bk in g.get("bookmakers", []):
+                    bname = BOOK_NAME_MAP.get(bk["key"], bk["key"])
+                    for m in bk.get("markets", []):
+                        if m["key"] != "spreads":
+                            continue
+                        for o in m.get("outcomes", []):
+                            team  = _normalize_team(o["name"])
+                            point = o.get("point")
+                            price = int(o["price"])
+                            key   = f"{team}_{'+' if point >= 0 else ''}{point}"
+                            spd.setdefault(key, {})[bname] = price
 
     games = []
     for gid, v in out_games.items():
@@ -376,44 +381,40 @@ def _fetch_odds_oddsapi(sport: str, markets: List[str], books: List[str]) -> dic
 # Public /odds endpoint with graceful fallback
 @app.get("/odds")
 def get_odds(sport: str, markets: Optional[List[str]] = None, books: Optional[List[str]] = None):
-    markets = markets or ["ml", "total"]
-    books = books or []
+    markets = _ensure_list(markets) or ["ml", "total"]
+    books   = _ensure_list(books)   or []
     try:
         data = _fetch_odds_oddsapi(sport, markets, books)
-        # If provider returned nothing at all, fall back once
         if not data.get("games"):
             raise RuntimeError("provider returned 0 games")
         return JSONResponse(data)
     except Exception as e:
-        # Fallback stub (keeps UI/actions usable)
         data = {
             "sport": sport,
             "markets": markets,
             "books": books or ["dk", "mgm", "czu"],
             "fallback_reason": str(e),
-            "games": [
-                {
-                    "game_id": f"mlb-nyy-hou-{dt.datetime.utcnow().date().isoformat()}",
-                    "away": "HOU",
-                    "home": "NYY",
-                    "markets": {
-                        "ml": {
-                            "HOU": {"dk": 110, "mgm": 112, "czu": 115},
-                            "NYY": {"dk": -130, "mgm": -128, "czu": -125},
-                        },
-                        "total": {
-                            "8.5_over": {"dk": -105, "mgm": -110},
-                            "8.5_under": {"dk": -115, "mgm": -110},
-                        },
+            "games": [{
+                "game_id": f"mlb-nyy-hou-{dt.datetime.utcnow().date().isoformat()}",
+                "away": "HOU",
+                "home": "NYY",
+                "markets": {
+                    "ml": {
+                        "HOU": {"dk": 110, "mgm": 112, "czu": 115},
+                        "NYY": {"dk": -130, "mgm": -128, "czu": -125},
                     },
-                }
-            ],
+                    "total": {
+                        "8.5_over": {"dk": -105, "mgm": -110},
+                        "8.5_under": {"dk": -115, "mgm": -110},
+                    },
+                },
+            }],
         }
         return JSONResponse(data)
 
-# ------------------------------
+# ==============================
 # Batch builder (from odds)
-# ------------------------------
+# ==============================
 def best_price_line(bookmap: Dict[str, int]) -> Tuple[str, int]:
     best_book, best_odds = None, None
     for book, price in bookmap.items():
@@ -426,8 +427,9 @@ def best_price_line(bookmap: Dict[str, int]) -> Tuple[str, int]:
     return best_book or "consensus", best_odds or 0
 
 @app.get("/build_batch")
-def build_batch(sport: str = "mlb"):
-    odds_resp = get_odds(sport=sport, markets=["ml", "total"]).body
+def build_batch(sport: str = "mlb", books: Optional[List[str]] = None):
+    books = _ensure_list(books) or ["bov"]
+    odds_resp = get_odds(sport=sport, markets=["ml", "total"], books=books).body
     import json
     odds = json.loads(odds_resp.decode("utf-8"))
 
@@ -471,9 +473,9 @@ def build_batch(sport: str = "mlb"):
 
     return JSONResponse({"items": items, "limits": {"ml": 5, "total": 5, "prop": 8}})
 
-# ------------------------------
+# ==============================
 # Ranking (model or batch)
-# ------------------------------
+# ==============================
 def _two_way_card(market: str, ref_id: str, sides: Dict[str, int], model_q: Dict[str, float], note: str = "") -> List[Dict[str, Any]]:
     keys = list(sides.keys())
     if len(keys) != 2:
@@ -507,9 +509,9 @@ def _two_way_card(market: str, ref_id: str, sides: Dict[str, int], model_q: Dict
 @app.post("/rank")
 def rank(payload: Dict[str, Any] = Body(...)):
     """
-    Accepts EITHER a single item OR a batch:
+    Single:
       { "market":"ml","game_id":"...","sides":{...},"model_q":{...} }
-    OR
+    Batch:
       { "min_edge":0.0, "items":[...], "limits":{"ml":5,"total":5,"prop":8} }
     """
     min_edge = float(payload.get("min_edge", EDGE_THRESHOLD_DEFAULT))
@@ -556,9 +558,9 @@ def rank(payload: Dict[str, Any] = Body(...)):
         "filters": {"edge_threshold": min_edge, "kelly_cap": MAX_KELLY, "limits": limits}
     })
 
-# ------------------------------
-# Consensus +EV scan (no external model)
-# ------------------------------
+# ==============================
+# Consensus +EV scan (Bovada-only by default)
+# ==============================
 def _devig_two_way_from_book(side_a_odds: int, side_b_odds: int) -> Tuple[float, float]:
     pa = american_to_implied(side_a_odds)
     pb = american_to_implied(side_b_odds)
@@ -611,117 +613,103 @@ def _pairs_for_total(total_market: Dict[str, Dict[str, int]], pts_key: str) -> L
 @app.get("/picks")
 def picks(
     sport: str = "mlb",
-    min_ev: float = 0.0,   # per $1 (e.g., 0.01 = +1 cent EV / $1)
-    min_edge: float = 0.0, # decimal (0.015 = 1.5%)
-    limit: int = 15
+    min_ev: float = 0.0,        # per $1, e.g. 0.005 = +0.5 cents
+    min_edge: float = 0.0,      # decimal (0.015 = 1.5%)
+    limit: int = 15,
+    books: Optional[List[str]] = None  # default Bovada
 ):
     """
-    Find +EV opportunities vs cross-book consensus (no external model).
-    Works for ML and a single totals number per game if available.
+    +EV scan vs *single book* (Bovada by default).
+    Handles ML, Totals (runs), and Spreads (run line).
+    Fair is de‑vig of the two sides from the same book.
     """
-    odds_resp = get_odds(sport=sport, markets=["ml", "total"]).body
+    books = _ensure_list(books) or ["bov"]
+
+    data = get_odds(sport=sport, markets=["ml","total","spread"], books=books).body
     import json
-    data = json.loads(odds_resp.decode("utf-8"))
+    data = json.loads(data.decode("utf-8"))
 
     candidates: List[Dict[str, Any]] = []
 
+    def _add_two_way(game_id: str, a_price: int, b_price: int, market_label: str, a_name: str, b_name: str, book: str):
+        fa, fb = _devig_two_way_from_book(a_price, b_price)
+        for name, q, odds in [(a_name, fa, a_price), (b_name, fb, b_price)]:
+            ev   = ev_per_dollar(q, odds)
+            edge = q - american_to_implied(odds)
+            if ev >= min_ev and edge >= min_edge:
+                candidates.append({
+                    "Market": market_label,
+                    "Game": game_id,
+                    "Side": name,
+                    "Book": book,
+                    "Line": odds,
+                    "ConsensusFair%": round(q*100, 1),
+                    "EV_per_$": round(ev, 4),
+                    "Kelly_half": round(min(kelly_half(q, odds), MAX_KELLY), 3),
+                })
+
     for g in data.get("games", []):
-        gid = g["game_id"]
-        away, home = g.get("away"), g.get("home")
+        gid  = g["game_id"]
+        away = g.get("away")
+        home = g.get("home")
         mkts = g.get("markets", {})
 
-        # Moneylines
+        # ML
         ml = mkts.get("ml", {})
-        if isinstance(ml, dict) and away in ml and home in ml and ml[away] and ml[home]:
-            pairs = _collect_two_way_pairs(ml, away, home)
-            if pairs:
-                fair_away, fair_home = _consensus_fair_from_books(pairs)
-                # Away offers
-                for bk, price in ml.get(away, {}).items():
-                    odds = int(price)
-                    q = fair_away
-                    ev = ev_per_dollar(q, odds)
-                    edge = q - american_to_implied(odds)
-                    if ev >= min_ev and edge >= min_edge:
-                        candidates.append({
-                            "Market": "ML",
-                            "Game": gid,
-                            "Side": away,
-                            "Book": bk,
-                            "Line": odds,
-                            "ConsensusFair%": round(q*100, 1),
-                            "EV_per_$": round(ev, 4),
-                            "Kelly_half": round(kelly_half(q, odds), 3),
-                        })
-                # Home offers
-                for bk, price in ml.get(home, {}).items():
-                    odds = int(price)
-                    q = fair_home
-                    ev = ev_per_dollar(q, odds)
-                    edge = q - american_to_implied(odds)
-                    if ev >= min_ev and edge >= min_edge:
-                        candidates.append({
-                            "Market": "ML",
-                            "Game": gid,
-                            "Side": home,
-                            "Book": bk,
-                            "Line": odds,
-                            "ConsensusFair%": round(q*100, 1),
-                            "EV_per_$": round(ev, 4),
-                            "Kelly_half": round(kelly_half(q, odds), 3),
-                        })
+        if away in ml and home in ml:
+            for bk in ml[away]:
+                if bk in books and bk in ml[home]:
+                    _add_two_way(gid, int(ml[away][bk]), int(ml[home][bk]), "ML", away, home, bk)
 
-        # Totals (first available points bucket)
-        tot = mkts.get("total")
+        # Totals: evaluate every points bucket for this book set
+        tot = mkts.get("total", {})
         if isinstance(tot, dict) and tot:
             pts_keys = sorted({k.split("_")[0] for k in tot.keys() if "_over" in k})
-            if pts_keys:
-                pts = pts_keys[0]
-                pairs = _pairs_for_total(tot, pts)
-                if pairs:
-                    fair_over, fair_under = _consensus_fair_from_books(pairs)
-                    over_key, under_key = f"{pts}_over", f"{pts}_under"
+            for pts in pts_keys:
+                over_key, under_key = f"{pts}_over", f"{pts}_under"
+                if over_key not in tot or under_key not in tot:
+                    continue
+                for bk in set(tot[over_key]).intersection(tot[under_key]):
+                    if bk in books:
+                        _add_two_way(gid, int(tot[over_key][bk]), int(tot[under_key][bk]), f"Total {pts}", "Over", "Under", bk)
 
-                    for bk, price in tot.get(over_key, {}).items():
-                        odds = int(price)
-                        q = fair_over
-                        ev = ev_per_dollar(q, odds)
-                        edge = q - american_to_implied(odds)
-                        if ev >= min_ev and edge >= min_edge:
-                            candidates.append({
-                                "Market": f"Total {pts}",
-                                "Game": gid,
-                                "Side": "Over",
-                                "Book": bk,
-                                "Line": odds,
-                                "ConsensusFair%": round(q*100, 1),
-                                "EV_per_$": round(ev, 4),
-                                "Kelly_half": round(kelly_half(q, odds), 3),
-                            })
+        # Spreads (run line)
+        spd = mkts.get("spread", {})
+        if isinstance(spd, dict) and spd:
+            # Pair home/away for each abs(point) and book
+            by_abs = defaultdict(lambda: defaultdict(dict))
+            for key in spd.keys():
+                try:
+                    team, point_str = key.rsplit("_", 1)
+                    point = float(point_str)
+                except Exception:
+                    continue
+                abs_p = abs(point)
+                for bk in spd[key]:
+                    if bk in books:
+                        side = "home" if team == home else "away"
+                        by_abs[abs_p][bk][side] = (team, int(spd[key][bk]), point)
 
-                    for bk, price in tot.get(under_key, {}).items():
-                        odds = int(price)
-                        q = fair_under
-                        ev = ev_per_dollar(q, odds)
-                        edge = q - american_to_implied(odds)
-                        if ev >= min_ev and edge >= min_edge:
-                            candidates.append({
-                                "Market": f"Total {pts}",
-                                "Game": gid,
-                                "Side": "Under",
-                                "Book": bk,
-                                "Line": odds,
-                                "ConsensusFair%": round(q*100, 1),
-                                "EV_per_$": round(ev, 4),
-                                "Kelly_half": round(kelly_half(q, odds), 3),
-                            })
+            for abs_p, per_book in by_abs.items():
+                for bk, sides in per_book.items():
+                    if "home" in sides and "away" in sides:
+                        home_team, home_price, home_point = sides["home"]
+                        away_team, away_price, away_point = sides["away"]
+                        _add_two_way(
+                            gid,
+                            home_price, away_price,
+                            f"Spread {abs_p:g}",
+                            f"{home_team} {home_point:+g}",
+                            f"{away_team} {away_point:+g}",
+                            bk
+                        )
 
     candidates.sort(key=lambda r: (r["EV_per_$"], r["Kelly_half"]), reverse=True)
     return JSONResponse({"picks": candidates[:max(1, min(limit, 50))], "count": len(candidates)})
 
-# ------------------------------
+# ==============================
 # News stub
-# ------------------------------
+# ==============================
 @app.get("/news/consensus")
 def news(sport: str):
     return JSONResponse({"sport": sport, "consensus": [], "injuries": [], "links": []})
