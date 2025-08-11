@@ -615,97 +615,176 @@ def picks(
     sport: str = "mlb",
     min_ev: float = 0.0,        # per $1, e.g. 0.005 = +0.5 cents
     min_edge: float = 0.0,      # decimal (0.015 = 1.5%)
-    limit: int = 15,
-    books: Optional[List[str]] = None  # default Bovada
+    limit: int = 30,
+    books: Optional[List[str]] = None,  # which books to RETURN as candidates; default Bovada
+    exclude_books_from_fair: Optional[List[str]] = None,  # books to EXCLUDE when computing consensus fair
 ):
     """
-    +EV scan vs *single book* (Bovada by default).
-    Handles ML, Totals (runs), and Spreads (run line).
-    Fair is de‑vig of the two sides from the same book.
+    +EV scan vs a target book set (default Bovada). We compute FAIR from a
+    consensus of *all* available books (optionally excluding the target book),
+    and only return candidates from the requested `books`.
     """
-    books = _ensure_list(books) or ["bov"]
-
-    data = get_odds(sport=sport, markets=["ml","total","spread"], books=books).body
     import json
-    data = json.loads(data.decode("utf-8"))
+
+    # -------- target book(s) to show as picks (default Bovada) --------
+    target_books = [b.lower() for b in (books or ["bov"])]
+
+    # -------- get consensus odds from all books --------
+    # Use None here to let the provider return everything it has
+    all_data = get_odds(sport=sport, markets=["ml", "total", "spread"], books=None).body
+    all_data = json.loads(all_data.decode("utf-8"))
+
+    # Which books to EXCLUDE from fair? (default: exclude the target books themselves)
+    fair_excludes = set([b.lower() for b in (exclude_books_from_fair or target_books)])
+
+    # Helper: build per-game market views for ALL books (for FAIR)
+    def _pairs_from_all_books_two_way(ml_market: Dict[str, Dict[str, int]], a_key: str, b_key: str) -> List[Tuple[int, int]]:
+        pairs = []
+        books_shared = set(ml_market.get(a_key, {})) & set(ml_market.get(b_key, {}))
+        for bk in books_shared:
+            if bk.lower() in fair_excludes:
+                continue
+            try:
+                a = int(ml_market[a_key][bk])
+                b = int(ml_market[b_key][bk])
+                pairs.append((a, b))
+            except Exception:
+                continue
+        return pairs
+
+    def _pairs_from_all_books_total(total_market: Dict[str, Dict[str, int]], pts_key: str) -> List[Tuple[int, int]]:
+        over_key, under_key = f"{pts_key}_over", f"{pts_key}_under"
+        if over_key not in total_market or under_key not in total_market:
+            return []
+        books_shared = set(total_market[over_key]) & set(total_market[under_key])
+        pairs = []
+        for bk in books_shared:
+            if bk.lower() in fair_excludes:
+                continue
+            try:
+                o = int(total_market[over_key][bk])
+                u = int(total_market[under_key][bk])
+                pairs.append((o, u))
+            except Exception:
+                continue
+        return pairs
+
+    # For spreads we’ll pair by absolute point per book
+    def _pairs_from_all_books_spread(spread_market: Dict[str, Dict[str, int]], home: str, away: str, abs_point: float) -> List[Tuple[int, int]]:
+        # Build per-book home/away price at the requested abs_point
+        per_book: Dict[str, Dict[str, int]] = {}
+        for key in spread_market.keys():
+            try:
+                team, point_str = key.rsplit("_", 1)
+                point = float(point_str)
+            except Exception:
+                continue
+            if abs(point) != abs_point:
+                continue
+            for bk, price in spread_market[key].items():
+                if bk.lower() in fair_excludes:
+                    continue
+                d = per_book.setdefault(bk, {})
+                if team == home:
+                    d["home"] = int(price)
+                elif team == away:
+                    d["away"] = int(price)
+        pairs = []
+        for bk, sides in per_book.items():
+            if "home" in sides and "away" in sides:
+                pairs.append((sides["home"], sides["away"]))
+        return pairs
+
+    # -------- get candidate odds from target book(s) only --------
+    tgt_data = get_odds(sport=sport, markets=["ml", "total", "spread"], books=target_books).body
+    tgt_data = json.loads(tgt_data.decode("utf-8"))
 
     candidates: List[Dict[str, Any]] = []
 
-    def _add_two_way(game_id: str, a_price: int, b_price: int, market_label: str, a_name: str, b_name: str, book: str):
-        fa, fb = _devig_two_way_from_book(a_price, b_price)
-        for name, q, odds in [(a_name, fa, a_price), (b_name, fb, b_price)]:
-            ev   = ev_per_dollar(q, odds)
-            edge = q - american_to_implied(odds)
-            if ev >= min_ev and edge >= min_edge:
-                candidates.append({
-                    "Market": market_label,
-                    "Game": game_id,
-                    "Side": name,
-                    "Book": book,
-                    "Line": odds,
-                    "ConsensusFair%": round(q*100, 1),
-                    "EV_per_$": round(ev, 4),
-                    "Kelly_half": round(min(kelly_half(q, odds), MAX_KELLY), 3),
-                })
+    # Index ALL-book games by id for quick lookup
+    all_by_gid = {g["game_id"]: g for g in all_data.get("games", [])}
 
-    for g in data.get("games", []):
+    def _push(game_id: str, market_label: str, side_name: str, odds: int, q_fair: float, book: str):
+        ev = ev_per_dollar(q_fair, odds)
+        edge = q_fair - american_to_implied(odds)
+        if ev >= min_ev and edge >= min_edge:
+            candidates.append({
+                "Market": market_label,
+                "Game": game_id,
+                "Side": side_name,
+                "Book": book,
+                "Line": odds,
+                "ConsensusFair%": round(q_fair * 100, 1),
+                "EV_per_$": round(ev, 4),
+                "Kelly_half": round(kelly_half(q_fair, odds), 3),
+            })
+
+    # Walk target-book games and grade against consensus FAIR
+    for g in tgt_data.get("games", []):
         gid  = g["game_id"]
         away = g.get("away")
         home = g.get("home")
-        mkts = g.get("markets", {})
+        mkts_tgt = g.get("markets", {})
+        mkts_all = all_by_gid.get(gid, {}).get("markets", {})
 
-        # ML
-        ml = mkts.get("ml", {})
-        if away in ml and home in ml:
-            for bk in ml[away]:
-                if bk in books and bk in ml[home]:
-                    _add_two_way(gid, int(ml[away][bk]), int(ml[home][bk]), "ML", away, home, bk)
+        # ---------- Moneyline ----------
+        ml_tgt = mkts_tgt.get("ml", {})
+        ml_all = mkts_all.get("ml", {})
+        if away in ml_tgt and home in ml_tgt and away in ml_all and home in ml_all:
+            pairs = _pairs_from_all_books_two_way(ml_all, away, home)
+            if pairs:
+                fair_away, fair_home = _consensus_fair_from_books(pairs)
+                for bk, price in ml_tgt.get(away, {}).items():
+                    if bk.lower() in (b.lower() for b in target_books):
+                        _push(gid, "ML", away, int(price), fair_away, bk)
+                for bk, price in ml_tgt.get(home, {}).items():
+                    if bk.lower() in (b.lower() for b in target_books):
+                        _push(gid, "ML", home, int(price), fair_home, bk)
 
-        # Totals: evaluate every points bucket for this book set
-        tot = mkts.get("total", {})
-        if isinstance(tot, dict) and tot:
-            pts_keys = sorted({k.split("_")[0] for k in tot.keys() if "_over" in k})
+        # ---------- Totals ----------
+        tot_tgt = mkts_tgt.get("total", {})
+        tot_all = mkts_all.get("total", {})
+        if isinstance(tot_tgt, dict) and isinstance(tot_all, dict) and tot_tgt and tot_all:
+            pts_keys = sorted({k.split("_")[0] for k in tot_all.keys() if "_over" in k})
             for pts in pts_keys:
-                over_key, under_key = f"{pts}_over", f"{pts}_under"
-                if over_key not in tot or under_key not in tot:
+                pairs = _pairs_from_all_books_total(tot_all, pts)
+                if not pairs:
                     continue
-                for bk in set(tot[over_key]).intersection(tot[under_key]):
-                    if bk in books:
-                        _add_two_way(gid, int(tot[over_key][bk]), int(tot[under_key][bk]), f"Total {pts}", "Over", "Under", bk)
+                fair_over, fair_under = _consensus_fair_from_books(pairs)
+                ok_over, ok_under = f"{pts}_over", f"{pts}_under"
+                for bk, price in tot_tgt.get(ok_over, {}).items():
+                    if bk.lower() in (b.lower() for b in target_books):
+                        _push(gid, f"Total {pts}", "Over", int(price), fair_over, bk)
+                for bk, price in tot_tgt.get(ok_under, {}).items():
+                    if bk.lower() in (b.lower() for b in target_books):
+                        _push(gid, f"Total {pts}", "Under", int(price), fair_under, bk)
 
-        # Spreads (run line)
-        spd = mkts.get("spread", {})
-        if isinstance(spd, dict) and spd:
-            # Pair home/away for each abs(point) and book
-            by_abs = defaultdict(lambda: defaultdict(dict))
-            for key in spd.keys():
-                try:
-                    team, point_str = key.rsplit("_", 1)
-                    point = float(point_str)
-                except Exception:
+        # ---------- Spreads ----------
+        spd_tgt = mkts_tgt.get("spread", {})
+        spd_all = mkts_all.get("spread", {})
+        if isinstance(spd_tgt, dict) and isinstance(spd_all, dict) and spd_tgt and spd_all:
+            # absolute points available in ALL-book view
+            abs_points = sorted({abs(float(k.rsplit("_", 1)[1])) for k in spd_all.keys() if "_" in k})
+            for ap in abs_points:
+                pairs = _pairs_from_all_books_spread(spd_all, home, away, ap)
+                if not pairs:
                     continue
-                abs_p = abs(point)
-                for bk in spd[key]:
-                    if bk in books:
-                        side = "home" if team == home else "away"
-                        by_abs[abs_p][bk][side] = (team, int(spd[key][bk]), point)
-
-            for abs_p, per_book in by_abs.items():
-                for bk, sides in per_book.items():
-                    if "home" in sides and "away" in sides:
-                        home_team, home_price, home_point = sides["home"]
-                        away_team, away_price, away_point = sides["away"]
-                        _add_two_way(
-                            gid,
-                            home_price, away_price,
-                            f"Spread {abs_p:g}",
-                            f"{home_team} {home_point:+g}",
-                            f"{away_team} {away_point:+g}",
-                            bk
-                        )
+                fair_home, fair_away = _consensus_fair_from_books(pairs)
+                # target prices at that point
+                home_key = next((k for k in spd_tgt if k.startswith(home + "_") and abs(float(k.rsplit("_", 1)[1])) == ap), None)
+                away_key = next((k for k in spd_tgt if k.startswith(away + "_") and abs(float(k.rsplit("_", 1)[1])) == ap), None)
+                if home_key:
+                    for bk, price in spd_tgt[home_key].items():
+                        if bk.lower() in (b.lower() for b in target_books):
+                            _push(gid, f"Spread {ap:g}", f"{home} {float(home_key.rsplit('_',1)[1]):+g}", int(price), fair_home, bk)
+                if away_key:
+                    for bk, price in spd_tgt[away_key].items():
+                        if bk.lower() in (b.lower() for b in target_books):
+                            _push(gid, f"Spread {ap:g}", f"{away} {float(away_key.rsplit('_',1)[1]):+g}", int(price), fair_away, bk)
 
     candidates.sort(key=lambda r: (r["EV_per_$"], r["Kelly_half"]), reverse=True)
-    return JSONResponse({"picks": candidates[:max(1, min(limit, 50))], "count": len(candidates)})
+    return JSONResponse({"picks": candidates[:max(1, min(limit, 100))], "count": len(candidates)})
+
 
 # ==============================
 # News stub
