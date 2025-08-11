@@ -1,6 +1,8 @@
 from typing import List, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse
+from fastapi import Query
+
 
 app = FastAPI(title="SharpEdge Actions", version="1.0.0")
 
@@ -92,12 +94,28 @@ def mlb_savant(player_id: str):
         "splits": {"vs_L": {"wOBA": 0.305}, "vs_R": {"wOBA": 0.320}}
     })
 
+
 @app.get("/fangraphs/projections")
-def fangraphs_projections(entity_id: str):
-    """Stub FanGraphs projections; always 200."""
+def fangraphs_projections(
+    # accept multiple aliases so the Action can't miss
+    entity_id: Optional[str] = Query(None, alias="entity_id"),
+    entityId: Optional[str] = Query(None, alias="entityId"),
+    player_id: Optional[str] = Query(None, alias="player_id"),
+    id_: Optional[str] = Query(None, alias="id"),
+):
+    # choose the first non-empty id provided
+    eid = entity_id or entityId or player_id or id_ or "UNKNOWN"
+
     return JSONResponse({
-        "entity_id": entity_id,
-        "projections": {"K%": 24.5, "BB%": 7.1, "ERA": 3.65, "wOBA": 0.334, "TB_per_game": 1.75}
+        "entity_id": eid,
+        "projections": {
+            "K%": 24.5,
+            "BB%": 7.1,
+            "ERA": 3.65,
+            "wOBA": 0.334,
+            "TB_per_game": 1.75
+        },
+        "meta": {"note": "stub projections"}
     })
 
 @app.post("/model/probability")
